@@ -1,6 +1,7 @@
 # GLM-Free-API for Cloudflare Workers
+About
 
-智谱清言网页版私有 API 的 Cloudflare Worker 代理层，提供 OpenAI / Claude / Gemini 三种协议兼容接口，支持流式对话、AI 绘图、视频生成与多账号 Token 轮询。
+智谱清言网页版的 Cloudflare Worker 2API层，提供 OpenAI / Claude / Gemini 三种协议兼容接口，支持流式对话、Tools调用、AI 绘图、视频生成与多账号 Token 轮询。
 
 ---
 
@@ -23,12 +24,7 @@
 
 本项目将智谱清言（chatglm.cn）网页端的私有流式 API 转换为标准的大语言模型服务接口，使任何支持 OpenAI、Claude 或 Gemini 协议的客户端都能直接调用 GLM 系列模型的能力。
 
-与原始 Node.js 版本相比，Cloudflare Worker 版本具备以下优势：
 
-- **零服务器成本**：Cloudflare Workers 免费额度内即可承载个人及小规模团队使用
-- **全球边缘部署**：请求在离用户最近的边缘节点处理，延迟更低
-- **无状态架构**：利用 KV 存储 Token 映射，无需维护持久化服务器
-- **即时扩缩容**：自动应对流量波动，无需关心并发限制
 
 ---
 
@@ -580,13 +576,6 @@ curl https://<your-worker-domain>/v1/models \
   -H "Authorization: Bearer <your-api-key>"
 ```
 
-当前可用模型：
-
-| 模型 ID    | 说明                            |
-| ---------- | ------------------------------- |
-| `glm-4.7`  | 高智能旗舰，通用对话与推理      |
-| `glm-4.6`  | 超强性能，200K 上下文，高级编码 |
-| `glm-4.6v` | 多模态版本，支持图像理解        |
 
 ### 响应中的 reasoning_content
 
@@ -620,55 +609,6 @@ curl https://<your-worker-domain>/v1/models \
 
 ---
 
-## 常见问题
-
-**Q: 为什么对话返回 `Invalid API key`？**
-
-A: 请确认已通过 `POST /admin/apikey` 接口添加了该 API Key。API Key 仅用于身份验证，与 refresh_token 无关。同时检查 `Authorization` header 格式是否为 `Bearer <api_key>`。
-
-**Q: 为什么对话返回 `No refresh tokens available in pool`？**
-
-A: 表示 API Key 验证通过了，但 Token 池中没有可用的 refresh_token。请通过 `POST /admin/token` 接口至少添加一个智谱 `refresh_token` 到池子中。
-
-**Q: 如何更新已失效的 refresh_token？**
-
-A: 重新登录 chatglm.cn 获取新的 `chatglm_refresh_token`，然后：
-1. 调用 `GET /admin/token` 查看失效 Token 的 `id`
-2. 调用 `DELETE /admin/token` 删除旧 Token
-3. 调用 `POST /admin/token` 添加新 Token
-
-全程无需修改任何客户端配置。
-
-**Q: 支持并发请求吗？**
-
-A: Cloudflare Workers 自动处理并发。智谱侧的单账号并发限制由平台决定，如需更高并发可在 Token 池中添加多个 `refresh_token`，系统会自动轮询调度。
-
-**Q: 在中国大陆如何使用？**
-
-A: 建议绑定自定义域名（如 `api.yourdomain.com`）并开启 Cloudflare 代理，或在使用端配置海外代理/VPS 转发。
-
-**Q: KV 写入后多久生效？**
-
-A: Cloudflare KV 是最终一致性存储，写入后通常几秒内全球生效，极端情况下可能延迟至 60 秒。
-
-**Q: 工具调用时为什么偶尔看不到 `tool_calls`，而是返回了普通文本？**
-
-A: 由于智谱 API 不原生支持工具调用，本项目依赖 Prompt Engineering 引导模型输出 JSON。若工具描述过于模糊或模型未理解意图，可能直接以自然语言回答。建议：
-
-1. 为每个工具提供清晰、具体的 `description`
-2. `parameters` 中的每个字段也添加 `description`
-3. 使用英文命名工具与字段（模型对英文指令遵循度更高）
-4. 如持续失败，可尝试在 `system` 消息中明确提醒模型“必须使用工具”
-
-**Q: 流式输出中工具调用的 JSON 会出现在 `content` 中吗？**
-
-A: 正常情况下不会。Worker 内置了智能缓冲机制：当检测到输出以 `{` 开头时会进入缓冲状态，确认是工具调用 JSON 后将其隐藏并仅输出 `tool_calls` 字段。但如果模型输出了非标准格式的 JSON，可能会有少量文本泄露。
-
-**Q: Claude 客户端（如 claude-code）如何使用工具调用？**
-
-A: 直接正常使用即可。Claude 协议的 `tools` 参数会自动转换为 OpenAI 格式处理，返回的 `tool_use` 块也会由 Worker 自动转换。你只需配置好 `CLAUDE_API_BASE_URL` 和 `apiKey`，claude-code 等工具会自动完成后续交互。
-
----
 
 ## 技术栈
 
