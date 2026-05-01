@@ -1,0 +1,16 @@
+name = "glm-free-api-worker"
+main = "src/index.ts"
+compatibility_date = "2024-05-12"
+
+[vars]
+SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb"
+# 管理 API 的保护密钥，建议部署前修改为随机强密码
+# 如未设置，管理接口将开放访问（不推荐用于生产环境）
+ADMIN_KEY = "changeme"
+
+# KV Namespace 绑定，用于存储 API Key 和 refresh_token
+# 首次部署前必须执行：npx wrangler kv:namespace create "GLM_TOKENS"
+# 然后将输出的 id 填入下方 id 字段
+[[kv_namespaces]]
+binding = "GLM_TOKENS"
+id = ""  # <-- 替换为你创建 KV 后得到的 id
