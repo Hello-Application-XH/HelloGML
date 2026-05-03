@@ -5,11 +5,16 @@
   "scripts": {
     "deploy": "wrangler deploy",
     "dev": "wrangler dev",
-    "start": "wrangler dev"
+    "start": "wrangler dev",
+    "feeder": "node playwright-feeder.js",
+    "feeder:bg": "nohup node playwright-feeder.js >> feeder.log 2>&1 &"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240512.0",
     "typescript": "^5.4.5",
-    "wrangler": "^3.57.0"
+    "wrangler": "^4.87.0"
+  },
+  "dependencies": {
+    "playwright": "^1.59.1"
   }
 }

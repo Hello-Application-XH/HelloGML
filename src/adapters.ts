@@ -19,7 +19,10 @@ export function convertClaudeToGLM(messages: any[], system?: string | any[]): an
       systemText = system;
     }
   }
-  let systemPrepended = false;
+  // 保留 system 消息，让 injectToolsPrompt 能正确追加工具提示
+  if (systemText) {
+    glmMessages.push({ role: "system", content: systemText });
+  }
   for (const msg of messages) {
     if (msg.role === "user") {
       let content = msg.content ?? "";
@@ -33,10 +36,6 @@ export function convertClaudeToGLM(messages: any[], system?: string | any[]): an
         }
         content = texts.join("\n");
       }
-      if (systemText && !systemPrepended) {
-        content = `${systemText}\n\n${content}`;
-        systemPrepended = true;
-      }
       glmMessages.push({ role: "user", content });
     } else if (msg.role === "assistant") {
       let content = msg.content ?? "";
@@ -45,7 +44,8 @@ export function convertClaudeToGLM(messages: any[], system?: string | any[]): an
         for (const item of content) {
           if (item.type === "text") texts.push(item.text);
           if (item.type === "tool_use") {
-            texts.push(`工具调用: ${item.name}\n参数: ${JSON.stringify(item.input || {})}`);
+            // 将 Claude 的 tool_use 转换为模型能理解的 JSON 格式
+            texts.push(`{"tool_calls":[{"name":"${item.name}","arguments":${JSON.stringify(item.input || {})}}]}`);
           }
         }
         content = texts.join("\n");
@@ -109,44 +109,139 @@ export function convertGLMStreamToClaude(glmStream: ReadableStream): ReadableStr
       const decoder = new TextDecoder();
       const messageId = uuid();
       let isFirstChunk = true;
+      let textBlockStarted = false;
+      let toolBlockIndex = -1;
+      let toolBlockStarted = false;
+      let sentToolIds = new Set<string>();
+      let streamClosed = false;
+
+      const safeEnqueue = (data: Uint8Array) => {
+        if (!streamClosed) controller.enqueue(data);
+      };
+
+      const sendMessageStart = () => {
+        safeEnqueue(encoder.encode(`event: message_start\ndata: ${JSON.stringify({
+          type: "message_start",
+          message: {
+            id: messageId, type: "message", role: "assistant", content: [],
+            model: MODEL_NAME, stop_reason: null, stop_sequence: null,
+            usage: { input_tokens: 0, output_tokens: 0 },
+          },
+        })}\n\n`));
+      };
+
+      const sendTextBlockStart = () => {
+        if (textBlockStarted) return;
+        textBlockStarted = true;
+        safeEnqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start", index: 0, content_block: { type: "text", text: "" },
+        })}\n\n`));
+      };
+
+      const sendTextDelta = (text: string) => {
+        safeEnqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta", index: 0, delta: { type: "text_delta", text },
+        })}\n\n`));
+      };
+
+      const sendTextBlockStop = () => {
+        if (!textBlockStarted) return;
+        textBlockStarted = false;
+        safeEnqueue(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({
+          type: "content_block_stop", index: 0,
+        })}\n\n`));
+      };
+
+      const sendToolBlockStart = (toolCall: any, idx: number) => {
+        if (sentToolIds.has(toolCall.id)) return;
+        sentToolIds.add(toolCall.id);
+        toolBlockIndex = idx;
+        toolBlockStarted = true;
+        safeEnqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify({
+          type: "content_block_start",
+          index: idx,
+          content_block: {
+            type: "tool_use",
+            id: toolCall.id,
+            name: toolCall.function?.name || "",
+            input: {},
+          },
+        })}\n\n`));
+      };
+
+      const sendToolDelta = (partialJson: string, idx: number) => {
+        safeEnqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify({
+          type: "content_block_delta",
+          index: idx,
+          delta: { type: "input_json_delta", partial_json: partialJson },
+        })}\n\n`));
+      };
+
+      const sendToolBlockStop = (idx: number) => {
+        if (!toolBlockStarted) return;
+        toolBlockStarted = false;
+        safeEnqueue(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({
+          type: "content_block_stop", index: idx,
+        })}\n\n`));
+      };
+
+      const sendMessageStop = (stopReason: string) => {
+        if (streamClosed) return;
+        streamClosed = true;
+        safeEnqueue(encoder.encode(`event: message_delta\ndata: ${JSON.stringify({
+          type: "message_delta",
+          delta: { stop_reason: stopReason, stop_sequence: null },
+          usage: { output_tokens: 1 },
+        })}\n\n`));
+        safeEnqueue(encoder.encode(`event: message_stop\ndata: ${JSON.stringify({
+          type: "message_stop",
+        })}\n\n`));
+        controller.close();
+      };
 
       const parser = createParser((event) => {
         try {
           const data = JSON.parse(event.data);
           if (data.choices && data.choices[0]) {
             const delta = data.choices[0].delta;
+            const finishReason = data.choices[0].finish_reason;
+
             if (isFirstChunk) {
-              controller.enqueue(encoder.encode(`event: message_start\ndata: ${JSON.stringify({
-                type: "message_start",
-                message: {
-                  id: messageId, type: "message", role: "assistant", content: [],
-                  model: MODEL_NAME, stop_reason: null, stop_sequence: null,
-                  usage: { input_tokens: 0, output_tokens: 0 },
-                },
-              })}\n\n`));
-              controller.enqueue(encoder.encode(`event: content_block_start\ndata: ${JSON.stringify({
-                type: "content_block_start", index: 0, content_block: { type: "text", text: "" },
-              })}\n\n`));
+              sendMessageStart();
               isFirstChunk = false;
             }
+
+            // 处理文本内容
             if (delta.content) {
-              controller.enqueue(encoder.encode(`event: content_block_delta\ndata: ${JSON.stringify({
-                type: "content_block_delta", index: 0, delta: { type: "text_delta", text: delta.content },
-              })}\n\n`));
+              sendTextBlockStart();
+              sendTextDelta(delta.content);
             }
-            if (data.choices[0].finish_reason) {
-              controller.enqueue(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({
-                type: "content_block_stop", index: 0,
-              })}\n\n`));
-              controller.enqueue(encoder.encode(`event: message_delta\ndata: ${JSON.stringify({
-                type: "message_delta",
-                delta: { stop_reason: "end_turn", stop_sequence: null },
-                usage: { output_tokens: 1 },
-              })}\n\n`));
-              controller.enqueue(encoder.encode(`event: message_stop\ndata: ${JSON.stringify({
-                type: "message_stop",
-              })}\n\n`));
-              controller.close();
+
+            // 处理工具调用（在 finish 时一次性发送）
+            if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+              delta.tool_calls.forEach((tc: any, i: number) => {
+                const idx = textBlockStarted ? i + 1 : i;
+                sendToolBlockStart(tc, idx);
+                const args = typeof tc.function?.arguments === "string"
+                  ? tc.function.arguments
+                  : JSON.stringify(tc.function?.arguments || {});
+                sendToolDelta(args, idx);
+                sendToolBlockStop(idx);
+              });
+            }
+
+            // finish
+            if (finishReason) {
+              let stopReason = "end_turn";
+              if (finishReason === "tool_calls") stopReason = "tool_use";
+              else if (finishReason !== "stop") stopReason = "max_tokens";
+
+              sendTextBlockStop();
+              // 如果还有未关闭的 tool block，关闭它
+              if (toolBlockStarted) {
+                sendToolBlockStop(toolBlockIndex);
+              }
+              sendMessageStop(stopReason);
             }
           }
         } catch (err) {
@@ -159,11 +254,12 @@ export function convertGLMStreamToClaude(glmStream: ReadableStream): ReadableStr
           const { done, value } = await reader.read();
           if (done) {
             if (!isFirstChunk) {
-              controller.enqueue(encoder.encode(`event: content_block_stop\ndata: ${JSON.stringify({ type: "content_block_stop", index: 0 })}\n\n`));
-              controller.enqueue(encoder.encode(`event: message_delta\ndata: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 1 } })}\n\n`));
-              controller.enqueue(encoder.encode(`event: message_stop\ndata: ${JSON.stringify({ type: "message_stop" })}\n\n`));
+              sendTextBlockStop();
+              if (toolBlockStarted) sendToolBlockStop(toolBlockIndex);
+              sendMessageStop("end_turn");
+            } else {
+              controller.close();
             }
-            controller.close();
             break;
           }
           parser.feed(decoder.decode(value, { stream: true }));

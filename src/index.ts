@@ -67,11 +67,13 @@ async function getTokenPool(kv: KVNamespace): Promise<{ id: string; token: strin
 
 let tokenRoundRobinIndex = 0;
 
-function selectTokenFromPool(tokens: { id: string; token: string }[]): string | null {
+const TOKEN_MAX_USES = 3;
+
+function selectTokenFromPool(tokens: { id: string; token: string }[]): { id: string; token: string } | null {
   if (tokens.length === 0) return null;
   const idx = tokenRoundRobinIndex % tokens.length;
   tokenRoundRobinIndex++;
-  return tokens[idx].token;
+  return tokens[idx];
 }
 
 async function authenticate(request: Request, env: Env): Promise<string> {
@@ -90,9 +92,20 @@ async function authenticate(request: Request, env: Env): Promise<string> {
   const pool = await getTokenPool(env.GLM_TOKENS);
   if (pool.length === 0) throw new Error("No refresh tokens available in pool");
 
-  const token = selectTokenFromPool(pool);
-  if (!token) throw new Error("Failed to select token from pool");
-  return token;
+  const selected = selectTokenFromPool(pool);
+  if (!selected) throw new Error("Failed to select token from pool");
+
+  // Track usage; auto-delete token after TOKEN_MAX_USES uses
+  const usageKey = `usage:${selected.id}`;
+  const uses = parseInt(await env.GLM_TOKENS.get(usageKey) || "0") + 1;
+  if (uses >= TOKEN_MAX_USES) {
+    await env.GLM_TOKENS.delete(`rt:${selected.id}`);
+    await env.GLM_TOKENS.delete(usageKey);
+  } else {
+    await env.GLM_TOKENS.put(usageKey, String(uses));
+  }
+
+  return selected.token;
 }
 
 function jsonResponse(data: any, status = 200): Response {

@@ -67,13 +67,15 @@ function injectToolsPrompt(messages: any[], tools: any[]): any[] {
 Description: ${fn.description || ""}
 Parameters: ${JSON.stringify(fn.parameters || {}, null, 2)}`;
   }).join("\n\n");
-  const prompt = `You are an assistant that can use tools. Follow these rules STRICTLY:
+  const prompt = `You are an assistant with access to tools. When you need to use a tool, you MUST output ONLY a single JSON object with NO markdown, NO explanations, and NO extra text.
 
-1. If you need to use a tool, your ENTIRE response must be a single JSON object in this exact format:
+STRICT RULES:
+1. If a tool is needed, output EXACTLY this format (nothing else):
 {"tool_calls":[{"name":"TOOL_NAME","arguments":{"param":"value"}}]}
 
-2. Do NOT include markdown code blocks, explanations, or any other text before or after the JSON.
-3. If no tool is needed, answer normally and do NOT output any JSON.
+2. Do NOT wrap the JSON in markdown code blocks (no \`\`\`json).
+3. Do NOT add any explanation before or after the JSON.
+4. If no tool is needed, respond normally with plain text.
 
 Available tools:
 ${toolsDesc}
@@ -96,42 +98,91 @@ Assistant: Hello! How can I help you today?`;
 }
 
 function parseToolCalls(content: string): { tool_calls: any[] | null; text: string } {
-  // 宽松匹配：支持双引号、单引号或无引号的 key
-  const match = content.match(/\{\s*["']?tool_calls["']?\s*:\s*\[[\s\S]*?\]\s*\}/);
-  if (!match) return { tool_calls: null, text: content };
-  try {
-    const parsed = JSON.parse(match[0]);
-    const toolCalls = parsed.tool_calls.map((tc: any, idx: number) => ({
-      id: `call_${Math.random().toString(36).slice(2, 11)}_${idx}`,
-      type: "function",
-      function: {
-        name: tc.name,
-        arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments || {}),
-      },
-    }));
-    const text = content.replace(match[0], "").trim();
-    return { tool_calls: toolCalls, text };
-  } catch (_) {
-    // 尝试修复常见 JSON 格式错误（单引号、无引号 key）后再解析
+  if (!content || !content.trim()) return { tool_calls: null, text: content };
+  let working = content.trim();
+
+  // 1. 去除 markdown 代码块（```json ... ``` 或 ``` ... ```）
+  const codeBlockMatch = working.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+  if (codeBlockMatch) {
+    working = codeBlockMatch[1].trim();
+  }
+
+  // 2. 尝试精确提取 {"tool_calls": [...]} 结构（支持嵌套对象）
+  const braceMatch = extractJsonObject(working, "tool_calls");
+  if (braceMatch) {
     try {
-      const fixed = match[0]
-        .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?\s*:/g, '"$2":')
-        .replace(/:\s*'([^']*)'/g, ':"$1"');
-      const parsed = JSON.parse(fixed);
+      const parsed = JSON.parse(braceMatch);
+      if (parsed.tool_calls && Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
+        const toolCalls = parsed.tool_calls.map((tc: any, idx: number) => ({
+          id: `call_${Math.random().toString(36).slice(2, 11)}_${idx}`,
+          type: "function",
+          function: {
+            name: tc.name || tc.function?.name || "",
+            arguments: typeof tc.arguments === "string"
+              ? tc.arguments
+              : typeof tc.function?.arguments === "string"
+                ? tc.function.arguments
+                : JSON.stringify(tc.arguments || tc.function?.arguments || {}),
+          },
+        }));
+        // 移除原始内容中的 JSON 部分（包括代码块）
+        let text = content.replace(braceMatch, "").trim();
+        if (codeBlockMatch) text = content.replace(codeBlockMatch[0], "").trim();
+        return { tool_calls: toolCalls, text };
+      }
+    } catch (_) {
+      // 继续尝试修复解析
+    }
+  }
+
+  // 3. 回退：尝试修复常见 JSON 格式错误后再解析
+  try {
+    const fixed = working
+      .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?\s*:/g, '"$2":')
+      .replace(/:\s*'([^']*)'/g, ':"$1"');
+    const parsed = JSON.parse(fixed);
+    if (parsed.tool_calls && Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
       const toolCalls = parsed.tool_calls.map((tc: any, idx: number) => ({
         id: `call_${Math.random().toString(36).slice(2, 11)}_${idx}`,
         type: "function",
         function: {
-          name: tc.name,
+          name: tc.name || tc.function?.name || "",
           arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments || {}),
         },
       }));
-      const text = content.replace(match[0], "").trim();
+      let text = content.replace(working, "").trim();
+      if (codeBlockMatch) text = content.replace(codeBlockMatch[0], "").trim();
       return { tool_calls: toolCalls, text };
-    } catch (_) {
-      return { tool_calls: null, text: content };
     }
+  } catch (_) {
+    // ignore
   }
+
+  return { tool_calls: null, text: content };
+}
+
+// 辅助函数：从字符串中提取以指定 key 开头的完整 JSON 对象（支持嵌套）
+function extractJsonObject(str: string, key: string): string | null {
+  const idx = str.indexOf(`"${key}"`);
+  if (idx === -1) return null;
+  // 向前找到 {
+  let start = idx;
+  while (start > 0 && str[start] !== "{") start--;
+  if (str[start] !== "{") return null;
+  // 向后匹配括号
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = start; i < str.length; i++) {
+    const ch = str[i];
+    if (escape) { escape = false; continue; }
+    if (ch === "\\") { escape = true; continue; }
+    if (ch === '"' && !escape) { inString = !inString; continue; }
+    if (inString) continue;
+    if (ch === "{") depth++;
+    else if (ch === "}") { depth--; if (depth === 0) return str.slice(start, i + 1); }
+  }
+  return null;
 }
 
 function convertToolMessages(messages: any[]): any[] {
@@ -405,13 +456,18 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.includes("text/event-stream")) {
       const errText = await response.text();
-      console.error("Invalid response Content-Type:", contentType, errText);
+      console.error("GLM upstream error | status:", response.status, "| content-type:", contentType, "| body:", errText);
+      let errMsg = `上游错误(${response.status})`;
+      try {
+        const errJson = JSON.parse(errText);
+        errMsg = errJson.message || errJson.msg || errJson.error || errText || errMsg;
+      } catch { errMsg = errText || errMsg; }
       const encoder = new TextEncoder();
       return new ReadableStream({
         start(controller) {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify({
             id: "", model: MODEL_NAME, object: "chat.completion.chunk",
-            choices: [{ index: 0, delta: { role: "assistant", content: "服务暂时不可用，第三方响应错误" }, finish_reason: "stop" }],
+            choices: [{ index: 0, delta: { role: "assistant", content: `服务暂时不可用：${errMsg}` }, finish_reason: "stop" }],
             usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
             created: unixTimestamp(),
           })}\n\n`));
