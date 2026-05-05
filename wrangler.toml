@@ -8,6 +8,16 @@ SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb"
 # 如未设置，管理接口将开放访问（不推荐用于生产环境）
 ADMIN_KEY = "changeme"
 
+# 自动补池配置（部署后也可通过管理面板动态修改）
+# 默认启用，部署后无需任何手动配置即可自动抓取游客 Token 维持服务
+AUTO_FILL_ENABLED = "true"     # 默认启用自动补池
+AUTO_FILL_TARGET = "5"         # 默认目标 Token 数量，保持 3~10 个即可稳定运行
+AUTO_FILL_CRON = "0 * * * *"   # 定时巡检 Cron 表达式，默认每小时
+
+# 定时触发器配置
+[triggers]
+crons = ["0 * * * *"]
+
 # KV Namespace 绑定，用于存储 api_key -> refresh_token 映射
 # 首次部署前需执行：npx wrangler kv:namespace create "GLM_TOKENS"
 # 然后将输出的 id 填入下方

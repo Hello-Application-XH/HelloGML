@@ -1,7 +1,6 @@
 # GLM-Free-API for Cloudflare Workers
-About
 
-智谱清言网页版的 Cloudflare Worker 2API层，提供 OpenAI / Claude / Gemini 三种协议兼容接口，支持流式对话、Tools调用、AI 绘图、视频生成与多账号 Token 轮询。
+智谱清言网页版私有 API 的 Cloudflare Worker 代理层，提供 OpenAI / Claude / Gemini 三种协议兼容接口，支持流式对话、AI 绘图、视频生成与多账号 Token 轮询。
 
 ---
 
@@ -24,7 +23,12 @@ About
 
 本项目将智谱清言（chatglm.cn）网页端的私有流式 API 转换为标准的大语言模型服务接口，使任何支持 OpenAI、Claude 或 Gemini 协议的客户端都能直接调用 GLM 系列模型的能力。
 
+与原始 Node.js 版本相比，Cloudflare Worker 版本具备以下优势：
 
+- **零服务器成本**：Cloudflare Workers 免费额度内即可承载个人及小规模团队使用
+- **全球边缘部署**：请求在离用户最近的边缘节点处理，延迟更低
+- **无状态架构**：利用 KV 存储 Token 映射，无需维护持久化服务器
+- **即时扩缩容**：自动应对流量波动，无需关心并发限制
 
 ---
 
@@ -36,6 +40,7 @@ About
 | **流式响应**        | 完整的 SSE 流式输出，支持逐字显示与 reasoning_content（思考过程） |
 | **动态 Token 管理** | 认证与资源分离：API Key 仅用于身份验证，所有 `refresh_token` 组成统一池子按轮询策略调度 |
 | **多账号轮询**      | 支持在 Authorization Header 中以逗号分隔传入多个 api_key，自动选择可用账号 |
+| **自动补池**        | 自动抓取游客 Token 补充号池，定时巡检并清理失效 Token，一次部署后完全自主运行 |
 | **AI 绘图**         | 对接智谱清言绘图智能体，支持文生图与多轮图生图               |
 | **视频生成**        | 支持文生视频、图生视频及风格参数控制                         |
 | **工具调用**        | 完整支持 Function Calling，兼容 OpenAI / Claude 格式，适配 claude-code、open-code 等 IDE |
@@ -121,7 +126,14 @@ SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb"
 
 # 管理接口保护密钥，部署前务必修改为随机强密码
 ADMIN_KEY = "your-random-strong-password"
+
+# 自动补池配置（可选，部署后也可通过管理面板动态修改）
+AUTO_FILL_ENABLED = "false"    # 是否启用自动抓取游客 Token 补充号池
+AUTO_FILL_TARGET = "5"         # 目标 Token 数量，建议 3~10
+AUTO_FILL_CRON = "0 * * * *"   # 定时巡检 Cron 表达式，默认每小时
 ```
+
+如需启用自动补池，建议将 `AUTO_FILL_ENABLED` 设为 `"true"` 并设置合理的 `AUTO_FILL_TARGET`。
 
 > **安全提示**：`ADMIN_KEY` 用于保护 `/admin/token` 接口。若留空或未设置，任何人都能修改 Token 映射，生产环境务必设置强密码。
 
@@ -238,9 +250,89 @@ curl -X DELETE https://<your-worker-domain>/admin/token \
 
 ---
 
+### 自动补池（Auto Fill）
+
+自动补池功能让 Worker 能够**完全自主运行**，无需手动维护 Token 池：
+
+- **自动抓取**：调用智谱游客接口获取新的 `refresh_token`，补充到号池
+- **定时巡检**：每小时自动检测池中所有 Token 的存活状态，删除已失效或限流的 Token
+- **自动补齐**：当可用 Token 数量低于设定目标时，自动补充差额
+- **零维护部署**：一次部署后无需任何人工干预
+
+#### 配置自动补池
+
+通过管理面板或 API 启用：
+
+```bash
+curl -X POST https://<your-worker-domain>/admin/auto-fill \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: <your-admin-key>" \
+  -d '{ "enabled": true, "target_count": 5 }'
+```
+
+| 参数           | 类型    | 说明                                                          |
+| -------------- | ------- | ------------------------------------------------------------- |
+| `enabled`      | boolean | 是否启用自动补池                                              |
+| `target_count` | number  | 目标 Token 数量，低于此值时自动补充（建议 3~10）              |
+
+响应：
+
+```json
+{
+  "success": true,
+  "config": { "enabled": true, "target_count": 5 },
+  "pool_count": 3,
+  "live_count": 3,
+  "schedule": { "cron": "0 * * * *", "timezone": "UTC" }
+}
+```
+
+#### 查看自动补池状态
+
+```bash
+curl -X GET https://<your-worker-domain>/admin/auto-fill \
+  -H "X-Admin-Key: <your-admin-key>"
+```
+
+#### 立即手动触发补池
+
+```bash
+curl -X POST https://<your-worker-domain>/admin/auto-fill/scan \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: <your-admin-key>"
+```
+
+响应中会包含本次执行的详细结果：新增了多少 Token、删除了多少失效 Token、当前可用数量等。
+
+#### 配置说明
+
+在 [`wrangler.toml`](wrangler.toml) 中已经默认启用：
+
+```toml
+[vars]
+AUTO_FILL_ENABLED = "true"    # 默认启用，部署后无需任何手动配置
+AUTO_FILL_TARGET = "5"        # 默认目标数量，保持 3~10 个即可稳定运行
+AUTO_FILL_CRON = "0 * * * *"  # Cron 表达式，默认每小时执行一次
+
+[triggers]
+crons = ["0 * * * *"]
+```
+
+> **提示**：环境变量仅作为首次部署时的默认值。部署后可通过管理面板或 API 动态修改配置，修改会持久化到 KV 中，优先级高于环境变量。即使首次请求时 Token 池为空，系统也会**自动冷启动补充**，真正实现零配置即用。
+
+#### 游客 Token 的使用
+
+自动补池添加的 Token 以 `auto_guest_` 为前缀标识。这些 Token 与手动添加的 Token 完全等价：
+
+- 参与轮询调度
+- 可通过 Token ID 直接作为 API Key 调用（如 `Bearer auto_guest_xxx`）
+- 会在定时巡检中被检测并自动清理
+
+---
+
 ### 多 Token 轮询
 
-系统会自动从 Token 池中按轮询策略选择可用账号。如需更高可用性，可在池子中添加多个 `refresh_token`。当某个 Token 失效时，只需在管理面板中更新池子即可，**无需修改任何客户端配置**。
+系统会自动从 Token 池中按轮询策略选择可用账号。如需更高可用性，可在池子中添加多个 `refresh_token`，或启用**自动补池**功能让 Worker 自动维护池子。当某个 Token 失效时，自动补池会自动清理并补充，**无需修改任何客户端配置**。
 
 同时，单次请求仍支持在 Authorization Header 中以逗号分隔传入多个 api_key（容错用途）：
 
@@ -576,6 +668,13 @@ curl https://<your-worker-domain>/v1/models \
   -H "Authorization: Bearer <your-api-key>"
 ```
 
+当前可用模型：
+
+| 模型 ID    | 说明                            |
+| ---------- | ------------------------------- |
+| `glm-4.7`  | 高智能旗舰，通用对话与推理      |
+| `glm-4.6`  | 超强性能，200K 上下文，高级编码 |
+| `glm-4.6v` | 多模态版本，支持图像理解        |
 
 ### 响应中的 reasoning_content
 
@@ -609,6 +708,57 @@ curl https://<your-worker-domain>/v1/models \
 
 ---
 
+## 常见问题
+
+**Q: 为什么对话返回 `Invalid API key`？**
+
+A: 请确认已通过 `POST /admin/apikey` 接口添加了该 API Key。API Key 仅用于身份验证，与 refresh_token 无关。同时检查 `Authorization` header 格式是否为 `Bearer <api_key>`。
+
+**Q: 为什么对话返回 `No refresh tokens available in pool`？**
+
+A: 表示 API Key 验证通过了，但 Token 池中没有可用的 refresh_token。请通过 `POST /admin/token` 接口至少添加一个智谱 `refresh_token` 到池子中。
+
+**Q: 如何更新已失效的 refresh_token？**
+
+A: 推荐启用**自动补池**功能（`POST /admin/auto-fill` 设置 `enabled: true`），Worker 会每小时自动检测并清理失效 Token，同时自动抓取新的游客 Token 补充到号池，完全无需人工维护。
+
+如需手动处理，可重新登录 chatglm.cn 获取新的 `chatglm_refresh_token`，然后：
+1. 调用 `GET /admin/token` 查看失效 Token 的 `id`
+2. 调用 `DELETE /admin/token` 删除旧 Token
+3. 调用 `POST /admin/token` 添加新 Token
+
+全程无需修改任何客户端配置。
+
+**Q: 支持并发请求吗？**
+
+A: Cloudflare Workers 自动处理并发。智谱侧的单账号并发限制由平台决定，如需更高并发可在 Token 池中添加多个 `refresh_token`，系统会自动轮询调度。
+
+**Q: 在中国大陆如何使用？**
+
+A: 建议绑定自定义域名（如 `api.yourdomain.com`）并开启 Cloudflare 代理，或在使用端配置海外代理/VPS 转发。
+
+**Q: KV 写入后多久生效？**
+
+A: Cloudflare KV 是最终一致性存储，写入后通常几秒内全球生效，极端情况下可能延迟至 60 秒。
+
+**Q: 工具调用时为什么偶尔看不到 `tool_calls`，而是返回了普通文本？**
+
+A: 由于智谱 API 不原生支持工具调用，本项目依赖 Prompt Engineering 引导模型输出 JSON。若工具描述过于模糊或模型未理解意图，可能直接以自然语言回答。建议：
+
+1. 为每个工具提供清晰、具体的 `description`
+2. `parameters` 中的每个字段也添加 `description`
+3. 使用英文命名工具与字段（模型对英文指令遵循度更高）
+4. 如持续失败，可尝试在 `system` 消息中明确提醒模型“必须使用工具”
+
+**Q: 流式输出中工具调用的 JSON 会出现在 `content` 中吗？**
+
+A: 正常情况下不会。Worker 内置了智能缓冲机制：当检测到输出以 `{` 开头时会进入缓冲状态，确认是工具调用 JSON 后将其隐藏并仅输出 `tool_calls` 字段。但如果模型输出了非标准格式的 JSON，可能会有少量文本泄露。
+
+**Q: Claude 客户端（如 claude-code）如何使用工具调用？**
+
+A: 直接正常使用即可。Claude 协议的 `tools` 参数会自动转换为 OpenAI 格式处理，返回的 `tool_use` 块也会由 Worker 自动转换。你只需配置好 `CLAUDE_API_BASE_URL` 和 `apiKey`，claude-code 等工具会自动完成后续交互。
+
+---
 
 ## 技术栈
 
