@@ -1,31 +1,50 @@
-import { setSignSecret } from "./chat.ts";
-import {
-  createCompletion,
-  createCompletionStream,
-  generateImages,
-  generateVideos,
-  getTokenLiveStatus,
-} from "./chat.ts";
-import {
-  createClaudeCompletion,
-  createGeminiCompletion,
-} from "./adapters.ts";
-import {
-  defaultTo,
-  isString,
-  unixTimestamp,
-} from "./utils.ts";
-import { WELCOME_HTML } from "./welcome.ts";
-import { getAdminPanelHTML } from "./admin-panel.ts";
+import { setSignSecret, createCompletion, createCompletionStream, generateImages, generateVideos } from "./chat.ts";
+import { createClaudeCompletion, createGeminiCompletion } from "./adapters.ts";
+import { defaultTo, isString, unixTimestamp, uuid, md5 } from "./utils.ts";
+const WELCOME_HTML = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>GLM Free API Neo</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 800px; margin: 60px auto; padding: 0 20px; color: #333; line-height: 1.6; }
+  h1 { color: #1a1a1a; }
+  code { background: #f4f4f4; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+  pre { background: #f4f4f4; padding: 16px; border-radius: 8px; overflow-x: auto; }
+  .endpoint { margin: 12px 0; padding: 12px; background: #fafafa; border-left: 4px solid #007acc; border-radius: 4px; }
+</style>
+</head>
+<body>
+<h1>GLM Free API Neo</h1>
+<p>零配置、无 KV、无管理界面的 GLM API 代理服务。</p>
+<p>每次请求自动获取访客 Token，无需 API Key，部署即用。</p>
+
+<h2>支持的端点</h2>
+<div class="endpoint"><strong>POST</strong> <code>/v1/chat/completions</code> — OpenAI 格式对话</div>
+<div class="endpoint"><strong>POST</strong> <code>/v1/messages</code> — Claude 格式对话</div>
+<div class="endpoint"><strong>POST</strong> <code>/v1beta/models/...:generateContent</code> — Gemini 格式对话</div>
+<div class="endpoint"><strong>POST</strong> <code>/v1/images/generations</code> — AI 绘图</div>
+<div class="endpoint"><strong>POST</strong> <code>/v1/videos/generations</code> — 视频生成</div>
+<div class="endpoint"><strong>GET</strong> <code>/v1/models</code> — 模型列表</div>
+
+<h2>使用示例</h2>
+<pre>curl http://localhost:8787/v1/chat/completions \\
+  -H "Content-Type: application/json" \\
+  -d '{"model":"glm-4-flash","messages":[{"role":"user","content":"你好"}]}'</pre>
+
+<p>无需 API Key，直接调用即可。</p>
+</body>
+</html>`;
 
 export interface Env {
   SIGN_SECRET?: string;
-  ADMIN_KEY?: string;
-  GLM_TOKENS: KVNamespace;
 }
 
+const DEFAULT_SIGN_SECRET = "8a1317a7468aa3ad86e997d08f3f31cb";
+
 const SUPPORTED_MODELS = [
-  { id: "glm5", name: "GLM-5", object: "model", owned_by: "glm-free-api", description: "GLM-5 通用对话模型" },
+  { id: "glm5", name: "GLM-5", object: "model", owned_by: "glm-free-api-neo", description: "GLM-5 通用对话模型" },
 ];
 
 const GEMINI_MODELS = [
@@ -41,58 +60,6 @@ function corsHeaders(): Record<string, string> {
     "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
     "Access-Control-Allow-Headers": "*",
   };
-}
-
-function extractAPIKeys(request: Request): string[] {
-  let auth = request.headers.get("authorization") || request.headers.get("x-api-key") || "";
-  if (!auth) return [];
-  if (!auth.toLowerCase().startsWith("bearer ")) auth = "Bearer " + auth;
-  return auth.slice(7).split(",").map((t) => t.trim()).filter(Boolean);
-}
-
-async function verifyAPIKey(kv: KVNamespace, apiKey: string): Promise<boolean> {
-  const val = await kv.get(`ak:${apiKey}`);
-  return val !== null;
-}
-
-async function getTokenPool(kv: KVNamespace): Promise<{ id: string; token: string }[]> {
-  const list = await kv.list({ prefix: "rt:" });
-  const tokens: { id: string; token: string }[] = [];
-  for (const key of list.keys) {
-    const token = await kv.get(key.name);
-    if (token) tokens.push({ id: key.name.replace("rt:", ""), token });
-  }
-  return tokens;
-}
-
-let tokenRoundRobinIndex = 0;
-
-function selectTokenFromPool(tokens: { id: string; token: string }[]): string | null {
-  if (tokens.length === 0) return null;
-  const idx = tokenRoundRobinIndex % tokens.length;
-  tokenRoundRobinIndex++;
-  return tokens[idx].token;
-}
-
-async function authenticate(request: Request, env: Env): Promise<string> {
-  const apiKeys = extractAPIKeys(request);
-  if (apiKeys.length === 0) throw new Error("Missing Authorization header");
-
-  let validKey = false;
-  for (const apiKey of apiKeys) {
-    if (await verifyAPIKey(env.GLM_TOKENS, apiKey)) {
-      validKey = true;
-      break;
-    }
-  }
-  if (!validKey) throw new Error("Invalid API key");
-
-  const pool = await getTokenPool(env.GLM_TOKENS);
-  if (pool.length === 0) throw new Error("No refresh tokens available in pool");
-
-  const token = selectTokenFromPool(pool);
-  if (!token) throw new Error("Failed to select token from pool");
-  return token;
 }
 
 function jsonResponse(data: any, status = 200): Response {
@@ -117,10 +84,73 @@ function sseResponse(stream: ReadableStream): Response {
   });
 }
 
-// ==================== Handlers ====================
+async function generateChatGLMSign(secret: string): Promise<{ timestamp: string; nonce: string; sign: string }> {
+  const now = Date.now().toString();
+  const length = now.length;
+  const digits = now.split("").map((char) => Number(char));
+  const checksum = (digits.reduce((sum, value) => sum + value, 0) - digits[length - 2]) % 10;
+  const timestamp = now.substring(0, length - 2) + checksum + now.substring(length - 1, length);
+  const nonce = uuid(false);
+  const sign = await md5(`${timestamp}-${nonce}-${secret}`);
+  return { timestamp, nonce, sign };
+}
+
+async function requestGuestRefreshToken(env: Env): Promise<{ refreshToken: string; accessToken: string; userId: string }> {
+  const signSecret = env.SIGN_SECRET || DEFAULT_SIGN_SECRET;
+  const sign = await generateChatGLMSign(signSecret);
+  const response = await fetch("https://chatglm.cn/chatglm/user-api/guest/access", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json;charset=utf-8",
+      "App-Name": "chatglm",
+      "X-Device-Id": uuid(false),
+      "X-Request-Id": uuid(false),
+      "X-App-Platform": "pc",
+      "X-App-Version": "0.0.1",
+      "X-App-fr": "browser",
+      "X-Lang": "zh-CN",
+      "X-Exp-Groups": "",
+      "X-Device-Model": "",
+      "X-Device-Brand": "",
+      "X-Timestamp": sign.timestamp,
+      "X-Nonce": sign.nonce,
+      "X-Sign": sign.sign,
+    },
+    body: "{}",
+  });
+
+  const rawText = await response.text();
+  let data: any = null;
+  try {
+    data = JSON.parse(rawText);
+  } catch {
+    throw new Error(`[Neo] guest/access 返回了非 JSON 内容: ${rawText.slice(0, 200)}`);
+  }
+
+  const success = data?.status === 0 || data?.code === 0 || data?.message === "success";
+  if (!response.ok || !success) {
+    throw new Error(`[Neo] 获取游客 token 失败: ${data?.message || response.statusText}`);
+  }
+
+  const result = data?.result;
+  if (!result?.refresh_token || !result?.access_token || !result?.user_id) {
+    throw new Error("[Neo] guest/access 未返回完整 token 信息");
+  }
+
+  return {
+    refreshToken: result.refresh_token,
+    accessToken: result.access_token,
+    userId: result.user_id,
+  };
+}
+
+async function authenticate(env: Env): Promise<string> {
+  const guest = await requestGuestRefreshToken(env);
+  return guest.refreshToken;
+}
 
 async function handleChatCompletions(request: Request, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const refreshToken = await authenticate(env);
   const body = (await request.json()) as any;
 
   if (!Array.isArray(body.messages)) throw new Error("messages must be an array");
@@ -136,7 +166,7 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
 }
 
 async function handleClaudeMessages(request: Request, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const refreshToken = await authenticate(env);
   const body = (await request.json()) as any;
 
   if (!Array.isArray(body.messages)) throw new Error("messages must be an array");
@@ -154,7 +184,7 @@ async function handleGeminiModels(): Promise<Response> {
 }
 
 async function handleGeminiGenerateContent(request: Request, path: string, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const refreshToken = await authenticate(env);
   const body = (await request.json()) as any;
 
   const modelMatch = path.match(/^\/v1beta\/models\/(.+):generateContent$/);
@@ -165,7 +195,7 @@ async function handleGeminiGenerateContent(request: Request, path: string, env: 
 }
 
 async function handleGeminiStreamGenerateContent(request: Request, path: string, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const refreshToken = await authenticate(env);
   const body = (await request.json()) as any;
 
   const modelMatch = path.match(/^\/v1beta\/models\/(.+):streamGenerateContent$/);
@@ -179,7 +209,7 @@ async function handleGeminiStreamGenerateContent(request: Request, path: string,
 }
 
 async function handleImageGenerations(request: Request, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const refreshToken = await authenticate(env);
   const body = (await request.json()) as any;
 
   if (!isString(body.prompt)) throw new Error("prompt must be a string");
@@ -199,17 +229,17 @@ async function handleImageGenerations(request: Request, env: Env): Promise<Respo
 
 async function fetchBase64(url: string): Promise<string> {
   const response = await fetch(url);
-  const arrayBuffer = await response.arrayBuffer();
-  const bytes = new Uint8Array(arrayBuffer);
+  const buffer = await response.arrayBuffer();
+  const bytes = new Uint8Array(buffer);
   let binary = "";
   for (let i = 0; i < bytes.byteLength; i++) {
     binary += String.fromCharCode(bytes[i]);
   }
-  return btoa(binary);
+  return "data:image/png;base64," + btoa(binary);
 }
 
 async function handleVideoGenerations(request: Request, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
+  const refreshToken = await authenticate(env);
   const body = (await request.json()) as any;
 
   if (!isString(body.prompt)) throw new Error("prompt must be a string");
@@ -231,107 +261,21 @@ async function handleVideoGenerations(request: Request, env: Env): Promise<Respo
   if (emotionalAtmosphere && !validEmotions.includes(emotionalAtmosphere)) throw new Error(`emotional_atmosphere must be one of ${validEmotions.join("/")}`);
   if (mirrorMode && !validMirrors.includes(mirrorMode)) throw new Error(`mirror_mode must be one of ${validMirrors.join("/")}`);
 
-  const data = await generateVideos(model, prompt, refreshToken, {
-    imageUrl: imageUrl || "",
+  const result = await generateVideos(model, prompt, refreshToken, {
+    imageUrl,
     videoStyle,
     emotionalAtmosphere,
     mirrorMode,
-    audioId: audioId || "",
+    audioId,
   }, convId);
-  return jsonResponse({ created: unixTimestamp(), data });
+  return jsonResponse({
+    created: unixTimestamp(),
+    data: result.map((item: any) => ({ url: item.url })),
+  });
 }
 
 async function handleModels(): Promise<Response> {
   return jsonResponse({ data: SUPPORTED_MODELS });
-}
-
-async function handleTokenCheck(request: Request, env: Env): Promise<Response> {
-  const refreshToken = await authenticate(request, env);
-  const live = await getTokenLiveStatus(refreshToken);
-  return jsonResponse({ live });
-}
-
-// ==================== Admin Handlers ====================
-
-async function handleAdminAPIKey(request: Request, env: Env): Promise<Response> {
-  const adminKey = request.headers.get("X-Admin-Key") || "";
-  if (env.ADMIN_KEY && adminKey !== env.ADMIN_KEY) {
-    return errorResponse("Unauthorized: invalid admin key", 401);
-  }
-
-  if (request.method === "POST") {
-    const body = (await request.json()) as any;
-    const apiKey = body.api_key;
-    if (!apiKey) return errorResponse("Missing api_key", 400);
-    await env.GLM_TOKENS.put(`ak:${apiKey}`, "1");
-    return jsonResponse({ success: true, message: "API key added successfully" });
-  }
-
-  if (request.method === "GET") {
-    const list = await env.GLM_TOKENS.list({ prefix: "ak:" });
-    const keys = list.keys.map((k) => ({
-      api_key: k.name.replace("ak:", ""),
-    }));
-    return jsonResponse({ keys });
-  }
-
-  if (request.method === "DELETE") {
-    const body = (await request.json()) as any;
-    const apiKey = body.api_key;
-    if (!apiKey) return errorResponse("Missing api_key", 400);
-    await env.GLM_TOKENS.delete(`ak:${apiKey}`);
-    return jsonResponse({ success: true, message: "API key deleted successfully" });
-  }
-
-  return errorResponse("Method not allowed", 405);
-}
-
-async function handleAdminToken(request: Request, env: Env): Promise<Response> {
-  const adminKey = request.headers.get("X-Admin-Key") || "";
-  if (env.ADMIN_KEY && adminKey !== env.ADMIN_KEY) {
-    return errorResponse("Unauthorized: invalid admin key", 401);
-  }
-
-  if (request.method === "POST") {
-    const body = (await request.json()) as any;
-    const refreshToken = body.refresh_token;
-    if (!refreshToken) return errorResponse("Missing refresh_token", 400);
-    const id = body.id || `tk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    await env.GLM_TOKENS.put(`rt:${id}`, refreshToken);
-    return jsonResponse({ success: true, message: "Token added to pool", id });
-  }
-
-  if (request.method === "GET") {
-    const pool = await getTokenPool(env.GLM_TOKENS);
-    return jsonResponse({ tokens: pool.map((t) => ({ id: t.id, token_preview: t.token.slice(0, 8) + "****" + t.token.slice(-4) })) });
-  }
-
-  if (request.method === "DELETE") {
-    const body = (await request.json()) as any;
-    const id = body.id;
-    if (!id) return errorResponse("Missing id", 400);
-    await env.GLM_TOKENS.delete(`rt:${id}`);
-    return jsonResponse({ success: true, message: "Token removed from pool" });
-  }
-
-  return errorResponse("Method not allowed", 405);
-}
-
-async function handleAdminTokenCheck(request: Request, env: Env): Promise<Response> {
-  const adminKey = request.headers.get("X-Admin-Key") || "";
-  if (env.ADMIN_KEY && adminKey !== env.ADMIN_KEY) {
-    return errorResponse("Unauthorized: invalid admin key", 401);
-  }
-
-  const body = (await request.json()) as any;
-  const id = body.id;
-  if (!id) return errorResponse("Missing id", 400);
-
-  const refreshToken = await env.GLM_TOKENS.get(`rt:${id}`);
-  if (!refreshToken) return errorResponse("Token not found", 404);
-
-  const live = await getTokenLiveStatus(refreshToken);
-  return jsonResponse({ id, live });
 }
 
 // ==================== Main Export ====================
@@ -354,10 +298,6 @@ export default {
         response = new Response(WELCOME_HTML, {
           headers: { "Content-Type": "text/html", ...corsHeaders() },
         });
-      } else if (path === "/admin" && request.method === "GET") {
-        response = new Response(getAdminPanelHTML(), {
-          headers: { "Content-Type": "text/html", ...corsHeaders() },
-        });
       } else if (path === "/v1/chat/completions" && request.method === "POST") {
         response = await handleChatCompletions(request, env);
       } else if (path === "/v1/messages" && request.method === "POST") {
@@ -376,14 +316,6 @@ export default {
         response = await handleModels();
       } else if (path === "/ping" && request.method === "GET") {
         response = new Response("pong", { headers: corsHeaders() });
-      } else if (path === "/token/check" && request.method === "POST") {
-        response = await handleTokenCheck(request, env);
-      } else if (path === "/admin/apikey") {
-        response = await handleAdminAPIKey(request, env);
-      } else if (path === "/admin/token") {
-        response = await handleAdminToken(request, env);
-      } else if (path === "/admin/token/check" && request.method === "POST") {
-        response = await handleAdminTokenCheck(request, env);
       } else {
         const message = `[请求有误]: 正确请求为 POST -> /v1/chat/completions，当前请求为 ${request.method} -> ${path} 请纠正`;
         response = errorResponse(message, 404);
