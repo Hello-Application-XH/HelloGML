@@ -5,6 +5,14 @@ import {
   randomChoice, sleep, fetchFileBASE64
 } from "./utils.ts";
 import { createParser } from "./sse.ts";
+import {
+  buildToolPromptParts,
+  formatToolCallsForPrompt,
+  isDefiniteToolCallStart,
+  isToolCallStartOrPrefix,
+  parseToolCalls,
+  selectToolsForChoice,
+} from "./toolcall.ts";
 
 const MODEL_NAME = "glm";
 const DEFAULT_ASSISTANT_ID = "65940acff94777010aa6b796";
@@ -12,6 +20,9 @@ const ACCESS_TOKEN_EXPIRES = 3600;
 const MAX_RETRY_COUNT = 3;
 const RETRY_DELAY = 5000;
 const FILE_MAX_SIZE = 100 * 1024 * 1024;
+const CONTEXT_FILE_NAME = "HelloGML_HISTORY.txt";
+const TOOLS_FILE_NAME = "HelloGML_TOOLS.txt";
+const DEFAULT_CONTEXT_FILE_MIN_CHARS = 12000;
 
 let signSecret = "8a1317a7468aa3ad86e997d08f3f31cb";
 
@@ -57,35 +68,18 @@ function getHeaders() {
   return { ...FAKE_HEADERS, "User-Agent": userAgent };
 }
 
+function getUploadHeaders() {
+  const baseHeaders: Record<string, string> = getHeaders();
+  const { "Content-Type": _contentType, ...headers } = baseHeaders;
+  return headers;
+}
+
 // ==================== Tool Calling Helpers ====================
 
-function injectToolsPrompt(messages: any[], tools: any[]): any[] {
-  if (!tools || tools.length === 0) return messages;
-  const toolsDesc = tools.map((tool: any) => {
-    const fn = tool.function || tool;
-    return `### ${fn.name}
-Description: ${fn.description || ""}
-Parameters: ${JSON.stringify(fn.parameters || {}, null, 2)}`;
-  }).join("\n\n");
-  const prompt = `You are an assistant with access to tools. When you need to use a tool, you MUST output ONLY a single JSON object with NO markdown, NO explanations, and NO extra text.
-
-STRICT RULES:
-1. If a tool is needed, output EXACTLY this format (nothing else):
-{"tool_calls":[{"name":"TOOL_NAME","arguments":{"param":"value"}}]}
-
-2. Do NOT wrap the JSON in markdown code blocks (no \`\`\`json).
-3. Do NOT add any explanation before or after the JSON.
-4. If no tool is needed, respond normally with plain text.
-
-Available tools:
-${toolsDesc}
-
-Examples:
-User: What is the weather in Beijing?
-Assistant: {"tool_calls":[{"name":"get_weather","arguments":{"location":"Beijing"}}]}
-
-User: Hello
-Assistant: Hello! How can I help you today?`;
+function injectToolsPrompt(messages: any[], tools: any[], includeDescriptions = true, toolChoice?: any): any[] {
+  const parts = buildToolPromptParts(tools || [], toolChoice);
+  const prompt = includeDescriptions ? parts.prompt : parts.promptWithoutDescriptions;
+  if (!prompt) return messages;
   const newMessages = [...messages];
   const systemIdx = newMessages.findIndex((m: any) => m.role === "system");
   if (systemIdx >= 0) {
@@ -97,94 +91,6 @@ Assistant: Hello! How can I help you today?`;
   return newMessages;
 }
 
-function parseToolCalls(content: string): { tool_calls: any[] | null; text: string } {
-  if (!content || !content.trim()) return { tool_calls: null, text: content };
-  let working = content.trim();
-
-  // 1. 去除 markdown 代码块（```json ... ``` 或 ``` ... ```）
-  const codeBlockMatch = working.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
-  if (codeBlockMatch) {
-    working = codeBlockMatch[1].trim();
-  }
-
-  // 2. 尝试精确提取 {"tool_calls": [...]} 结构（支持嵌套对象）
-  const braceMatch = extractJsonObject(working, "tool_calls");
-  if (braceMatch) {
-    try {
-      const parsed = JSON.parse(braceMatch);
-      if (parsed.tool_calls && Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
-        const toolCalls = parsed.tool_calls.map((tc: any, idx: number) => ({
-          id: `call_${Math.random().toString(36).slice(2, 11)}_${idx}`,
-          type: "function",
-          function: {
-            name: tc.name || tc.function?.name || "",
-            arguments: typeof tc.arguments === "string"
-              ? tc.arguments
-              : typeof tc.function?.arguments === "string"
-                ? tc.function.arguments
-                : JSON.stringify(tc.arguments || tc.function?.arguments || {}),
-          },
-        }));
-        // 移除原始内容中的 JSON 部分（包括代码块）
-        let text = content.replace(braceMatch, "").trim();
-        if (codeBlockMatch) text = content.replace(codeBlockMatch[0], "").trim();
-        return { tool_calls: toolCalls, text };
-      }
-    } catch (_) {
-      // 继续尝试修复解析
-    }
-  }
-
-  // 3. 回退：尝试修复常见 JSON 格式错误后再解析
-  try {
-    const fixed = working
-      .replace(/(['"])?([a-zA-Z0-9_]+)(['"])?\s*:/g, '"$2":')
-      .replace(/:\s*'([^']*)'/g, ':"$1"');
-    const parsed = JSON.parse(fixed);
-    if (parsed.tool_calls && Array.isArray(parsed.tool_calls) && parsed.tool_calls.length > 0) {
-      const toolCalls = parsed.tool_calls.map((tc: any, idx: number) => ({
-        id: `call_${Math.random().toString(36).slice(2, 11)}_${idx}`,
-        type: "function",
-        function: {
-          name: tc.name || tc.function?.name || "",
-          arguments: typeof tc.arguments === "string" ? tc.arguments : JSON.stringify(tc.arguments || {}),
-        },
-      }));
-      let text = content.replace(working, "").trim();
-      if (codeBlockMatch) text = content.replace(codeBlockMatch[0], "").trim();
-      return { tool_calls: toolCalls, text };
-    }
-  } catch (_) {
-    // ignore
-  }
-
-  return { tool_calls: null, text: content };
-}
-
-// 辅助函数：从字符串中提取以指定 key 开头的完整 JSON 对象（支持嵌套）
-function extractJsonObject(str: string, key: string): string | null {
-  const idx = str.indexOf(`"${key}"`);
-  if (idx === -1) return null;
-  // 向前找到 {
-  let start = idx;
-  while (start > 0 && str[start] !== "{") start--;
-  if (str[start] !== "{") return null;
-  // 向后匹配括号
-  let depth = 0;
-  let inString = false;
-  let escape = false;
-  for (let i = start; i < str.length; i++) {
-    const ch = str[i];
-    if (escape) { escape = false; continue; }
-    if (ch === "\\") { escape = true; continue; }
-    if (ch === '"' && !escape) { inString = !inString; continue; }
-    if (inString) continue;
-    if (ch === "{") depth++;
-    else if (ch === "}") { depth--; if (depth === 0) return str.slice(start, i + 1); }
-  }
-  return null;
-}
-
 function convertToolMessages(messages: any[]): any[] {
   return messages.map((m: any) => {
     if (m.role === "tool") {
@@ -193,8 +99,103 @@ function convertToolMessages(messages: any[]): any[] {
         content: `工具 ${m.name || ""} (调用ID: ${m.tool_call_id || ""}) 返回结果：\n${m.content || ""}`,
       };
     }
+    if (m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      const toolHistory = formatToolCallsForPrompt(m.tool_calls);
+      const content = [m.content || "", toolHistory].filter(Boolean).join("\n");
+      return { ...m, content };
+    }
     return m;
   });
+}
+
+async function prepareChatInput(messages: any[], refreshToken: string, tools: any[] = [], toolChoice?: any): Promise<{ messages: any[]; refs: any[]; tools: any[] }> {
+  const activeTools = selectToolsForChoice(tools, toolChoice);
+  const processedMessages = convertToolMessages(messages);
+  const refFileUrls = extractRefFileUrls(processedMessages);
+  const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))) : [];
+  const contextInput = await applyContextFiles(processedMessages, refreshToken, activeTools, refs, toolChoice);
+  if (contextInput) return contextInput;
+  return { messages: injectToolsPrompt(processedMessages, activeTools, true, toolChoice), refs, tools: activeTools };
+}
+
+async function applyContextFiles(messages: any[], refreshToken: string, tools: any[], existingRefs: any[], toolChoice?: any): Promise<{ messages: any[]; refs: any[]; tools: any[] } | null> {
+  if (!runtimeBool("HELLOGML_CONTEXT_FILE_ENABLED", true)) return null;
+  const transcript = buildHistoryTranscript(messages);
+  if (!transcript.trim()) return null;
+
+  const toolParts = buildToolPromptParts(tools || [], toolChoice);
+  const minChars = runtimeInt("HELLOGML_CONTEXT_FILE_MIN_CHARS", DEFAULT_CONTEXT_FILE_MIN_CHARS);
+  const totalChars = transcript.length + toolParts.toolsText.length;
+  if (minChars > 0 && totalChars < minChars) return null;
+
+  const refs = [...existingRefs];
+  const historyRef = await uploadTextFile(CONTEXT_FILE_NAME, transcript, refreshToken);
+  refs.unshift(historyRef);
+
+  let hasToolsFile = false;
+  if (toolParts.toolsText.trim()) {
+    const toolsRef = await uploadTextFile(TOOLS_FILE_NAME, toolParts.toolsText, refreshToken);
+    refs.unshift(toolsRef);
+    hasToolsFile = true;
+  }
+
+  const continuationPrompt = [
+    `Continue from the latest state in the attached ${CONTEXT_FILE_NAME}.`,
+    "Treat it as the complete current conversation history and answer the latest user request directly.",
+    hasToolsFile ? `Available tool descriptions and parameter schemas are attached in ${TOOLS_FILE_NAME}; use only those tools and follow the tool-call format rules in this prompt.` : "",
+  ].filter(Boolean).join(" ");
+
+  const liveMessages = [{ role: "user", content: continuationPrompt }];
+  return { messages: injectToolsPrompt(liveMessages, tools, false, toolChoice), refs, tools };
+}
+
+function buildHistoryTranscript(messages: any[]): string {
+  const parts = ["# HelloGML_HISTORY.txt", "Prior conversation history, tool calls, and tool results.", ""];
+  let index = 0;
+  for (const message of messages) {
+    const role = String(message?.role || "unknown").toUpperCase();
+    const content = normalizeMessageContent(message?.content).trim();
+    if (!content) continue;
+    index++;
+    parts.push(`=== ${index}. ${role} ===`, content, "");
+  }
+  return parts.join("\n").trim() + "\n";
+}
+
+function normalizeMessageContent(content: any): string {
+  if (content == null) return "";
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content.map((item) => {
+      if (!isObject(item)) return "";
+      if (item.type === "text") return item.text || "";
+      if (item.type === "file") return `[file attached: ${item.file_url?.url || item.file?.file_id || "uploaded file"}]`;
+      if (item.type === "image_url") return `[image attached: ${item.image_url?.url || "uploaded image"}]`;
+      return "";
+    }).filter(Boolean).join("\n");
+  }
+  try {
+    return JSON.stringify(content);
+  } catch {
+    return String(content);
+  }
+}
+
+function runtimeBool(name: string, defaultValue: boolean): boolean {
+  const value = runtimeEnv(name);
+  if (value == null || value === "") return defaultValue;
+  return !["0", "false", "no", "off"].includes(String(value).toLowerCase());
+}
+
+function runtimeInt(name: string, defaultValue: number): number {
+  const value = runtimeEnv(name);
+  if (value == null || value === "") return defaultValue;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : defaultValue;
+}
+
+function runtimeEnv(name: string): string | undefined {
+  return (globalThis as any).process?.env?.[name] || (globalThis as any)[name];
 }
 
 function getWorkerCache(): Cache {
@@ -345,12 +346,9 @@ async function glmPostStream(url: string, body: any, headers: Record<string, str
   }
 }
 
-export async function createCompletion(messages: any[], refreshToken: string, model = MODEL_NAME, refConvId = "", retryCount = 0, tools?: any[]): Promise<any> {
+export async function createCompletion(messages: any[], refreshToken: string, model = MODEL_NAME, refConvId = "", retryCount = 0, tools?: any[], toolChoice?: any): Promise<any> {
   return (async () => {
-    let processedMessages = convertToolMessages(messages);
-    processedMessages = injectToolsPrompt(processedMessages, tools || []);
-    const refFileUrls = extractRefFileUrls(processedMessages);
-    const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))) : [];
+    const prepared = await prepareChatInput(messages, refreshToken, tools || [], toolChoice);
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
     let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
     let chatMode = '';
@@ -365,7 +363,7 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
         conversation_id: refConvId,
         project_id: "",
         chat_type: "user_chat",
-        messages: messagesPrepare(processedMessages, refs, !!refConvId),
+        messages: messagesPrepare(prepared.messages, prepared.refs, !!refConvId),
         meta_data: {
           channel: "",
           chat_mode: chatMode || undefined,
@@ -395,25 +393,22 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
       console.error(errText);
       throw new Error(`Stream response Content-Type invalid: ${contentType}`);
     }
-    const answer = await receiveStream(model, response.body!, tools);
+    const answer = await receiveStream(model, response.body!, prepared.tools);
     removeConversation(answer.id, refreshToken, assistantId).catch(() => {});
     return answer;
   })().catch(async (err) => {
     if (retryCount < MAX_RETRY_COUNT) {
       console.error(`Stream response error: ${err.stack || err.message}`);
       await sleep(RETRY_DELAY);
-      return createCompletion(messages, refreshToken, model, refConvId, retryCount + 1, tools);
+      return createCompletion(messages, refreshToken, model, refConvId, retryCount + 1, tools, toolChoice);
     }
     throw err;
   });
 }
 
-export async function createCompletionStream(messages: any[], refreshToken: string, model = MODEL_NAME, refConvId = "", retryCount = 0, tools?: any[]): Promise<ReadableStream> {
+export async function createCompletionStream(messages: any[], refreshToken: string, model = MODEL_NAME, refConvId = "", retryCount = 0, tools?: any[], toolChoice?: any): Promise<ReadableStream> {
   return (async () => {
-    let processedMessages = convertToolMessages(messages);
-    processedMessages = injectToolsPrompt(processedMessages, tools || []);
-    const refFileUrls = extractRefFileUrls(processedMessages);
-    const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))) : [];
+    const prepared = await prepareChatInput(messages, refreshToken, tools || [], toolChoice);
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
     let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
     let chatMode = '';
@@ -428,7 +423,7 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
         conversation_id: refConvId,
         project_id: "",
         chat_type: "user_chat",
-        messages: messagesPrepare(processedMessages, refs, !!refConvId),
+        messages: messagesPrepare(prepared.messages, prepared.refs, !!refConvId),
         meta_data: {
           channel: "",
           chat_mode: chatMode || undefined,
@@ -477,12 +472,12 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
     }
     return createTransStream(model, response.body!, (convId: string) => {
       removeConversation(convId, refreshToken, assistantId).catch(() => {});
-    }, tools);
+    }, prepared.tools);
   })().catch(async (err) => {
     if (retryCount < MAX_RETRY_COUNT) {
       console.error(`Stream response error: ${err.stack || err.message}`);
       await sleep(RETRY_DELAY);
-      return createCompletionStream(messages, refreshToken, model, refConvId, retryCount + 1, tools);
+      return createCompletionStream(messages, refreshToken, model, refConvId, retryCount + 1, tools, toolChoice);
     }
     throw err;
   });
@@ -748,7 +743,24 @@ async function uploadFile(fileUrl: string, refreshToken: string, isVideoImage = 
     headers: {
       Authorization: `Bearer ${token}`,
       Referer: isVideoImage ? "https://chatglm.cn/video" : "https://chatglm.cn/",
-      ...getHeaders(),
+      ...getUploadHeaders(),
+    },
+    body: formData,
+  });
+  const uploadResult = await checkResult(response, refreshToken);
+  return uploadResult.result;
+}
+
+async function uploadTextFile(filename: string, text: string, refreshToken: string) {
+  const token = await acquireToken(refreshToken);
+  const formData = new FormData();
+  formData.append("file", new Blob([text], { type: "text/plain; charset=utf-8" }), filename);
+  const response = await fetch("https://chatglm.cn/chatglm/backend-api/assistant/file_upload", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      Referer: "https://chatglm.cn/",
+      ...getUploadHeaders(),
     },
     body: formData,
   });
@@ -868,8 +880,7 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
   let sentContent = "";
   let sentReasoning = "";
   let fullContent = "";
-  let isToolCallMode = false;
-  let mightBeToolCall = false;
+  let toolOutputMode: "detecting" | "tool" | "text" = tools && tools.length > 0 ? "detecting" : "text";
   let pendingContent = "";
   const cachedParts: any[] = [];
   return new ReadableStream({
@@ -956,48 +967,30 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
             if (chunk) {
               sentContent += chunk;
               fullContent += chunk;
-              // 智能缓冲：检测是否可能是纯工具调用 JSON，避免先发送部分 JSON 文本
-              if (!isToolCallMode && tools && tools.length > 0) {
-                const trimmed = fullContent.trim();
-                if (!mightBeToolCall) {
-                  // 如果内容以 { 开头，可能是工具调用，进入缓冲模式
-                  if (trimmed.startsWith("{")) {
-                    mightBeToolCall = true;
-                    pendingContent += chunk;
-                  } else {
-                    // 不以 { 开头，直接发送
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                      id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
-                      choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
-                      created,
-                    })}\n\n`));
-                  }
-                } else {
-                  // 已在缓冲模式，继续累积
-                  pendingContent += chunk;
-                  // 当累积足够内容后，判断是否是工具调用
-                  if (trimmed.length >= 20) {
-                    if (trimmed.includes('"tool_calls"') || trimmed.includes("'tool_calls'") || trimmed.includes("tool_calls")) {
-                      isToolCallMode = true;
-                      pendingContent = "";
-                    } else {
-                      // 不是工具调用，一次性发送缓冲内容
-                      mightBeToolCall = false;
-                      controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                        id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
-                        choices: [{ index: 0, delta: { content: pendingContent }, finish_reason: null }],
-                        created,
-                      })}\n\n`));
-                      pendingContent = "";
-                    }
-                  }
-                }
-              } else if (!isToolCallMode) {
+              if (toolOutputMode === "text") {
                 controller.enqueue(encoder.encode(`data: ${JSON.stringify({
                   id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
                   choices: [{ index: 0, delta: { content: chunk }, finish_reason: null }],
                   created,
                 })}\n\n`));
+              } else if (toolOutputMode === "detecting") {
+                pendingContent += chunk;
+                const trimmed = pendingContent.trimStart();
+                const legacyJSONToolStart = trimmed.startsWith("{") && (trimmed.length < 24 || trimmed.includes("tool_calls"));
+                if (isDefiniteToolCallStart(trimmed) || (trimmed.startsWith("{") && trimmed.includes("tool_calls"))) {
+                  toolOutputMode = "tool";
+                  pendingContent = "";
+                } else if (isToolCallStartOrPrefix(trimmed) || legacyJSONToolStart) {
+                  // Keep buffering until the prefix is either confirmed as a tool call or released as normal text.
+                } else {
+                  toolOutputMode = "text";
+                  controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                    id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
+                    choices: [{ index: 0, delta: { content: pendingContent }, finish_reason: null }],
+                    created,
+                  })}\n\n`));
+                  pendingContent = "";
+                }
               }
             }
           } else {
@@ -1009,6 +1002,14 @@ function createTransStream(model: string, readableStream: ReadableStream, endCal
                 finishReason = "tool_calls";
                 delta = { tool_calls: parsed.tool_calls };
               }
+            }
+            if (finishReason === "stop" && pendingContent) {
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",
+                choices: [{ index: 0, delta: { content: pendingContent }, finish_reason: null }],
+                created,
+              })}\n\n`));
+              pendingContent = "";
             }
             controller.enqueue(encoder.encode(`data: ${JSON.stringify({
               id: result.conversation_id, model: MODEL_NAME, object: "chat.completion.chunk",

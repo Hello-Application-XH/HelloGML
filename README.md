@@ -595,15 +595,17 @@ curl https://<your-worker-domain>/v1/models \
 
 ### 工具调用实现机制
 
-由于智谱清言网页版 API 暂不原生支持工具调用，本项目采用 **Prompt Engineering + 后处理解析** 的方案实现兼容：
+由于智谱清言网页版 API 暂不原生支持工具调用，本项目采用 **DSML/XML 工具协议 + 后处理解析** 的方案实现兼容：
 
-1. **注入工具描述**：请求前将可用工具的名称、描述、参数结构以结构化英文指令形式注入到 `system` 消息中，并附带 Few-shot 示例，引导模型在需要时输出标准 JSON。
+1. **注入工具描述**：请求前将可用工具的名称、描述、参数结构注入到 `system` 消息中，引导模型在需要时输出 `<|DSML|tool_calls>` / `<|DSML|invoke>` / `<|DSML|parameter>` 工具块。旧 JSON `tool_calls` 仍作为兼容兜底解析。
 
-2. **智能流式缓冲**：在流式输出场景下，Worker 会检测输出内容是否以 `{` 开头。若是，则缓冲约 20 个字符后判断其是否为工具调用 JSON；确认后将其解析为 `tool_calls`，避免 JSON 文本泄露到普通 `content` 中。
+2. **流式防泄漏**：在流式输出场景下，服务会检测 DSML/XML 工具块或旧 JSON 工具调用起始片段。确认是工具调用后不会把原始工具文本泄露到普通 `content`，结束时输出结构化 `delta.tool_calls`。
 
-3. **鲁棒解析**：`parseToolCalls` 函数支持标准 JSON、单引号 JSON 以及无引号 key 的宽松格式；若解析失败，会尝试常见修复策略（补全括号、替换单引号等）后再次解析。
+3. **鲁棒解析**：`parseToolCalls` 优先解析 DSML/XML 工具块，支持 CDATA 字符串参数、数组 `<item>` 参数和 legacy `<tool_calls>` 标签；JSON 工具调用保留为兼容路径。
 
-4. **协议转换**：Claude 协议的 `tool_use` / `tool_result` 消息会在进入智谱前被转换为 OpenAI 的 `tool_calls` / `tool` 格式，返回时再转换回去，确保对上层客户端完全透明。
+4. **协议转换**：Claude 协议的 `tool_use` 历史会转换为 DSML 工具块，`tool_result` 会转换为模型可读的工具结果文本，返回时再转换回 Claude 的 `tool_use` / `tool_result` 格式。
+
+5. **长上下文文件化**：当完整历史与工具 schema 超过阈值时，服务会把历史上传为 `HelloGML_HISTORY.txt`，把工具定义上传为 `HelloGML_TOOLS.txt`，live prompt 只保留继续指令和工具格式规则，降低直接 prompt 体积。可用 `HELLOGML_CONTEXT_FILE_ENABLED=false` 关闭，或用 `HELLOGML_CONTEXT_FILE_MIN_CHARS=0` 强制每轮启用；默认阈值为 `12000` 字符。
 
 > **已知限制**：工具调用的可靠性取决于模型对 prompt 指令的遵循程度。过于复杂的嵌套参数或含糊的工具描述可能导致解析失败。建议为工具提供清晰、准确的 `description` 和 `parameters` 定义。
 

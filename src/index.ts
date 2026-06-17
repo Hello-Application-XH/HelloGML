@@ -55,14 +55,26 @@ async function verifyAPIKey(kv: KVNamespace, apiKey: string): Promise<boolean> {
   return val !== null;
 }
 
+const TOKEN_POOL_KEY = "rt_pool";
+
 async function getTokenPool(kv: KVNamespace): Promise<{ id: string; token: string }[]> {
+  const raw = await kv.get(TOKEN_POOL_KEY);
+  if (raw !== null) {
+    try { return JSON.parse(raw); } catch { return []; }
+  }
+  // One-time migration: read legacy rt:xxx individual keys and consolidate
   const list = await kv.list({ prefix: "rt:" });
   const tokens: { id: string; token: string }[] = [];
   for (const key of list.keys) {
     const token = await kv.get(key.name);
     if (token) tokens.push({ id: key.name.replace("rt:", ""), token });
   }
+  await kv.put(TOKEN_POOL_KEY, JSON.stringify(tokens));
   return tokens;
+}
+
+async function saveTokenPool(kv: KVNamespace, pool: { id: string; token: string }[]): Promise<void> {
+  await kv.put(TOKEN_POOL_KEY, JSON.stringify(pool));
 }
 
 let tokenRoundRobinIndex = 0;
@@ -99,7 +111,7 @@ async function authenticate(request: Request, env: Env): Promise<string> {
   const usageKey = `usage:${selected.id}`;
   const uses = parseInt(await env.GLM_TOKENS.get(usageKey) || "0") + 1;
   if (uses >= TOKEN_MAX_USES) {
-    await env.GLM_TOKENS.delete(`rt:${selected.id}`);
+    await saveTokenPool(env.GLM_TOKENS, pool.filter(t => t.id !== selected.id));
     await env.GLM_TOKENS.delete(usageKey);
   } else {
     await env.GLM_TOKENS.put(usageKey, String(uses));
@@ -140,10 +152,10 @@ async function handleChatCompletions(request: Request, env: Env): Promise<Respon
 
   const { model, conversation_id: convId, messages, stream, tools, tool_choice } = body;
   if (stream) {
-    const glmStream = await createCompletionStream(messages, refreshToken, model, convId, 0, tools);
+    const glmStream = await createCompletionStream(messages, refreshToken, model, convId, 0, tools, tool_choice);
     return sseResponse(glmStream);
   } else {
-    const result = await createCompletion(messages, refreshToken, model, convId, 0, tools);
+    const result = await createCompletion(messages, refreshToken, model, convId, 0, tools, tool_choice);
     return jsonResponse(result);
   }
 }
@@ -154,8 +166,8 @@ async function handleClaudeMessages(request: Request, env: Env): Promise<Respons
 
   if (!Array.isArray(body.messages)) throw new Error("messages must be an array");
 
-  const { model, messages, system, stream, conversation_id: convId, tools } = body;
-  const result = await createClaudeCompletion(model, messages, system, refreshToken, stream, convId, tools);
+  const { model, messages, system, stream, conversation_id: convId, tools, tool_choice } = body;
+  const result = await createClaudeCompletion(model, messages, system, refreshToken, stream, convId, tools, tool_choice);
   if (stream && result instanceof ReadableStream) {
     return sseResponse(result);
   }
@@ -172,8 +184,8 @@ async function handleGeminiGenerateContent(request: Request, path: string, env: 
 
   const modelMatch = path.match(/^\/v1beta\/models\/(.+):generateContent$/);
   const model = modelMatch ? modelMatch[1] : "gemini-pro";
-  const { contents, systemInstruction, conversation_id: convId } = body;
-  const result = await createGeminiCompletion(model, contents, systemInstruction, refreshToken, false, convId);
+  const { contents, systemInstruction, conversation_id: convId, tools, toolConfig } = body;
+  const result = await createGeminiCompletion(model, contents, systemInstruction, refreshToken, false, convId, tools, toolConfig);
   return jsonResponse(result);
 }
 
@@ -183,8 +195,8 @@ async function handleGeminiStreamGenerateContent(request: Request, path: string,
 
   const modelMatch = path.match(/^\/v1beta\/models\/(.+):streamGenerateContent$/);
   const model = modelMatch ? modelMatch[1] : "gemini-pro";
-  const { contents, systemInstruction, conversation_id: convId } = body;
-  const result = await createGeminiCompletion(model, contents, systemInstruction, refreshToken, true, convId);
+  const { contents, systemInstruction, conversation_id: convId, tools, toolConfig } = body;
+  const result = await createGeminiCompletion(model, contents, systemInstruction, refreshToken, true, convId, tools, toolConfig);
   if (result instanceof ReadableStream) {
     return sseResponse(result);
   }
@@ -310,7 +322,9 @@ async function handleAdminToken(request: Request, env: Env): Promise<Response> {
     const refreshToken = body.refresh_token;
     if (!refreshToken) return errorResponse("Missing refresh_token", 400);
     const id = body.id || `tk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    await env.GLM_TOKENS.put(`rt:${id}`, refreshToken);
+    const pool = await getTokenPool(env.GLM_TOKENS);
+    pool.push({ id, token: refreshToken });
+    await saveTokenPool(env.GLM_TOKENS, pool);
     return jsonResponse({ success: true, message: "Token added to pool", id });
   }
 
@@ -323,7 +337,9 @@ async function handleAdminToken(request: Request, env: Env): Promise<Response> {
     const body = (await request.json()) as any;
     const id = body.id;
     if (!id) return errorResponse("Missing id", 400);
-    await env.GLM_TOKENS.delete(`rt:${id}`);
+    const pool = await getTokenPool(env.GLM_TOKENS);
+    await saveTokenPool(env.GLM_TOKENS, pool.filter(t => t.id !== id));
+    await env.GLM_TOKENS.delete(`usage:${id}`);
     return jsonResponse({ success: true, message: "Token removed from pool" });
   }
 
@@ -340,7 +356,8 @@ async function handleAdminTokenCheck(request: Request, env: Env): Promise<Respon
   const id = body.id;
   if (!id) return errorResponse("Missing id", 400);
 
-  const refreshToken = await env.GLM_TOKENS.get(`rt:${id}`);
+  const pool = await getTokenPool(env.GLM_TOKENS);
+  const refreshToken = pool.find(t => t.id === id)?.token;
   if (!refreshToken) return errorResponse("Token not found", 404);
 
   const live = await getTokenLiveStatus(refreshToken);

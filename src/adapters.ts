@@ -4,6 +4,7 @@ import {
   createCompletion,
   createCompletionStream,
 } from "./chat.ts";
+import { formatToolCallsForPrompt } from "./toolcall.ts";
 
 const MODEL_NAME = "glm";
 
@@ -44,8 +45,10 @@ export function convertClaudeToGLM(messages: any[], system?: string | any[]): an
         for (const item of content) {
           if (item.type === "text") texts.push(item.text);
           if (item.type === "tool_use") {
-            // 将 Claude 的 tool_use 转换为模型能理解的 JSON 格式
-            texts.push(`{"tool_calls":[{"name":"${item.name}","arguments":${JSON.stringify(item.input || {})}}]}`);
+            texts.push(formatToolCallsForPrompt([{
+              type: "function",
+              function: { name: item.name, arguments: JSON.stringify(item.input || {}) },
+            }]));
           }
         }
         content = texts.join("\n");
@@ -275,15 +278,15 @@ export function convertGLMStreamToClaude(glmStream: ReadableStream): ReadableStr
 
 export async function createClaudeCompletion(
   model: string, messages: any[], system: string | any[] | undefined,
-  refreshToken: string, stream = false, conversationId?: string, tools?: any[]
+  refreshToken: string, stream = false, conversationId?: string, tools?: any[], toolChoice?: any
 ): Promise<any | ReadableStream> {
   const glmMessages = convertClaudeToGLM(messages, system);
   const openaiTools = tools && tools.length > 0 ? convertClaudeToolsToOpenAI(tools) : undefined;
   if (stream) {
-    const glmStream = await createCompletionStream(glmMessages, refreshToken, model, conversationId, 0, openaiTools);
+    const glmStream = await createCompletionStream(glmMessages, refreshToken, model, conversationId, 0, openaiTools, toolChoice);
     return convertGLMStreamToClaude(glmStream);
   } else {
-    const glmResponse = await createCompletion(glmMessages, refreshToken, model, conversationId, 0, openaiTools);
+    const glmResponse = await createCompletion(glmMessages, refreshToken, model, conversationId, 0, openaiTools, toolChoice);
     return convertGLMToClaude(glmResponse);
   }
 }
@@ -305,7 +308,21 @@ export function convertGeminiToGLM(contents: any[], systemInstruction?: any): an
     const role = content.role === "model" ? "assistant" : "user";
     let text = "";
     if (content.parts && Array.isArray(content.parts)) {
-      text = content.parts.filter((part: any) => part.text).map((part: any) => part.text).join("\n");
+      const texts: string[] = [];
+      for (const part of content.parts) {
+        if (part.text) texts.push(part.text);
+        if (part.functionCall) {
+          texts.push(formatToolCallsForPrompt([{
+            type: "function",
+            function: { name: part.functionCall.name, arguments: JSON.stringify(part.functionCall.args || {}) },
+          }]));
+        }
+        if (part.functionResponse) {
+          const response = part.functionResponse.response ?? part.functionResponse;
+          texts.push(`工具调用结果 (${part.functionResponse.name || ""}):\n${typeof response === "string" ? response : JSON.stringify(response)}`);
+        }
+      }
+      text = texts.join("\n");
     }
     if (role === "user" && systemText && !systemPrepended) {
       text = `${systemText}\n\n${text}`;
@@ -316,12 +333,60 @@ export function convertGeminiToGLM(contents: any[], systemInstruction?: any): an
   return glmMessages;
 }
 
+function convertGeminiToolsToOpenAI(tools: any[] | undefined): any[] | undefined {
+  if (!Array.isArray(tools) || tools.length === 0) return undefined;
+  const out: any[] = [];
+  for (const group of tools) {
+    const declarations = group.functionDeclarations || group.function_declarations || [];
+    for (const fn of declarations) {
+      if (!fn?.name) continue;
+      out.push({
+        type: "function",
+        function: {
+          name: fn.name,
+          description: fn.description || "",
+          parameters: fn.parameters || {},
+        },
+      });
+    }
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+function convertGeminiToolChoice(toolConfig: any): any {
+  const cfg = toolConfig?.functionCallingConfig || toolConfig?.function_calling_config;
+  if (!cfg) return undefined;
+  const mode = String(cfg.mode || "").toUpperCase();
+  if (mode === "NONE") return "none";
+  if (mode === "ANY") {
+    const names = cfg.allowedFunctionNames || cfg.allowed_function_names || [];
+    if (Array.isArray(names) && names.length === 1) {
+      return { type: "function", function: { name: names[0] } };
+    }
+    return "required";
+  }
+  return undefined;
+}
+
 export function convertGLMToGemini(glmResponse: any): any {
-  const content = glmResponse.choices[0].message.content;
+  const message = glmResponse.choices[0].message;
+  const parts: any[] = [];
+  if (message.content) parts.push({ text: message.content });
+  if (message.tool_calls) {
+    for (const tc of message.tool_calls) {
+      parts.push({
+        functionCall: {
+          name: tc.function.name,
+          args: typeof tc.function.arguments === "string" ? JSON.parse(tc.function.arguments || "{}") : (tc.function.arguments || {}),
+        },
+      });
+    }
+  }
+  if (parts.length === 0) parts.push({ text: "" });
   return {
     candidates: [{
-      content: { parts: [{ text: content }], role: "model" },
-      finishReason: glmResponse.choices[0].finish_reason === "stop" ? "STOP" : "MAX_TOKENS",
+      content: { parts, role: "model" },
+      finishReason: glmResponse.choices[0].finish_reason === "tool_calls" ? "STOP" : (glmResponse.choices[0].finish_reason === "stop" ? "STOP" : "MAX_TOKENS"),
       index: 0,
       safetyRatings: [],
     }],
@@ -350,11 +415,24 @@ export function convertGLMStreamToGemini(glmStream: ReadableStream): ReadableStr
                 candidates: [{ content: { parts: [{ text: delta.content }], role: "model" }, finishReason: null, index: 0, safetyRatings: [] }],
               })}\n\n`));
             }
-            if (data.choices[0].finish_reason) {
+            if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+              const parts = delta.tool_calls.map((tc: any) => ({
+                functionCall: {
+                  name: tc.function?.name || "",
+                  args: typeof tc.function?.arguments === "string" ? JSON.parse(tc.function.arguments || "{}") : (tc.function?.arguments || {}),
+                },
+              }));
               controller.enqueue(encoder.encode(`data: ${JSON.stringify({
-                candidates: [{ content: { parts: [{ text: "" }], role: "model" }, finishReason: "STOP", index: 0, safetyRatings: [] }],
-                usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+                candidates: [{ content: { parts, role: "model" }, finishReason: "STOP", index: 0, safetyRatings: [] }],
               })}\n\n`));
+            }
+            if (data.choices[0].finish_reason) {
+              if (!delta.tool_calls) {
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({
+                  candidates: [{ content: { parts: [{ text: "" }], role: "model" }, finishReason: "STOP", index: 0, safetyRatings: [] }],
+                  usageMetadata: { promptTokenCount: 1, candidatesTokenCount: 1, totalTokenCount: 2 },
+                })}\n\n`));
+              }
               controller.close();
             }
           }
@@ -380,14 +458,16 @@ export function convertGLMStreamToGemini(glmStream: ReadableStream): ReadableStr
 
 export async function createGeminiCompletion(
   model: string, contents: any[], systemInstruction: any,
-  refreshToken: string, stream = false, conversationId?: string
+  refreshToken: string, stream = false, conversationId?: string, tools?: any[], toolConfig?: any
 ): Promise<any | ReadableStream> {
   const glmMessages = convertGeminiToGLM(contents, systemInstruction);
+  const openaiTools = convertGeminiToolsToOpenAI(tools);
+  const toolChoice = convertGeminiToolChoice(toolConfig);
   if (stream) {
-    const glmStream = await createCompletionStream(glmMessages, refreshToken, model, conversationId);
+    const glmStream = await createCompletionStream(glmMessages, refreshToken, model, conversationId, 0, openaiTools, toolChoice);
     return convertGLMStreamToGemini(glmStream);
   } else {
-    const glmResponse = await createCompletion(glmMessages, refreshToken, model, conversationId);
+    const glmResponse = await createCompletion(glmMessages, refreshToken, model, conversationId, 0, openaiTools, toolChoice);
     return convertGLMToGemini(glmResponse);
   }
 }
