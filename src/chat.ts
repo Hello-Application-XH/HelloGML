@@ -20,41 +20,96 @@ export function setSignSecret(secret: string) {
 }
 
 const USER_AGENTS = [
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:124.0) Gecko/20100101 Firefox/124.0",
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:124.0) Gecko/20100101 Firefox/124.0"
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/154.0.0.0 Safari/537.36"
 ];
 
 const FAKE_HEADERS: Record<string, string> = {
   "Accept": "text/event-stream",
-  "Accept-Encoding": "gzip, deflate, br, zstd",
-  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
+  "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
   "App-Name": "chatglm",
   "Cache-Control": "no-cache",
   "Content-Type": "application/json",
   "Origin": "https://chatglm.cn",
   "Pragma": "no-cache",
   "Priority": "u=1, i",
-  "Sec-Ch-Ua": '"Microsoft Edge";v="143", "Chromium";v="143", "Not A(Brand";v="24"',
+  "Sec-Ch-Ua": '"Chromium";v="154", "Google Chrome";v="154", "Not A(Brand";v="99"',
   "Sec-Ch-Ua-Mobile": "?0",
   "Sec-Ch-Ua-Platform": '"Windows"',
   "Sec-Fetch-Dest": "empty",
   "Sec-Fetch-Mode": "cors",
   "Sec-Fetch-Site": "same-origin",
-  "X-App-Fr": "browser_extension",
+  "X-App-Fr": "default",
   "X-App-Platform": "pc",
   "X-App-Version": "0.0.1",
   "X-Device-Brand": "",
   "X-Device-Model": "",
-  "X-Exp-Groups": "na_android_config:exp:NA,na_4o_config:exp:4o_A,tts_config:exp:tts_config_a,na_glm4plus_config:exp:open,mainchat_server_app:exp:A,mobile_history_daycheck:exp:a,desktop_toolbar:exp:A,chat_drawing_server:exp:A,drawing_server_cogview:exp:cogview4,app_welcome_v2:exp:A,chat_drawing_streamv2:exp:A,mainchat_rm_fc:exp:add,mainchat_dr:exp:open,chat_auto_entrance:exp:A,drawing_server_hi_dream:control:A,homepage_square:exp:close,assistant_recommend_prompt:exp:3,app_home_regular_user:exp:A,memory_common:exp:enable,mainchat_moe:exp:300,assistant_greet_user:exp:greet_user,app_welcome_personalize:exp:A,assistant_model_exp_group:exp:glm4.5,ai_wallet:exp:ai_wallet_enable",
+  "X-Exp-Groups": "na_android_config:exp:NA,na_4o_config:exp:4o_A,tts_config:exp:tts_config_a,na_glm4plus_config:exp:open,mainchat_server_app:exp:A,mobile_history_daycheck:exp:a,desktop_toolbar:exp:A,chat_drawing_server:exp:A,drawing_server_cogview:exp:cogview4,app_welcome_v2:exp:A,chat_drawing_streamv2:exp:A,mainchat_rm_fc:exp:add,mainchat_dr:exp:open,chat_auto_entrance:exp:A,drawing_server_hi_dream:control:A,homepage_square:exp:close,assistant_recommend_prompt:exp:1,app_home_regular_user:exp:A,mainchat_moe:exp:300,assistant_greet_user:exp:greet_user,app_welcome_personalize:exp:A,assistant_model_exp_group:exp:glm4.5,ai_wallet:exp:ai_wallet_enable",
   "X-Lang": "zh"
 };
 
 function getHeaders() {
   const userAgent = randomChoice(USER_AGENTS) || USER_AGENTS[0];
   return { ...FAKE_HEADERS, "User-Agent": userAgent };
+}
+
+// ==================== Credential ====================
+// 2026-10 新防护：核心接口（backend-api/assistant/stream 等）要求携带
+// ssxmod_itna / ssxmod_itna2 等风控 cookie，缺失时返回 bad request(40012)。
+// 因此 token 池条目支持附加 cookie 串，与 token 成对存储。
+// 同时支持直接配置 access token（type=access，24h 有效），跳过 refresh。
+
+export interface Credential {
+  token: string;
+  cookie?: string;
+}
+
+function normalizeCredential(input: string | Credential): Credential {
+  if (typeof input === "string") return { token: input };
+  return input;
+}
+
+function extractJwtPayload(jwt: string): any | null {
+  try {
+    const parts = jwt.split(".");
+    if (parts.length < 2) return null;
+    let payload = parts[1].replace(/-/g, "+").replace(/_/g, "/");
+    while (payload.length % 4) payload += "=";
+    return JSON.parse(atob(payload));
+  } catch {}
+  return null;
+}
+
+function isAccessToken(token: string): boolean {
+  const payload = extractJwtPayload(token);
+  return !!payload && payload.type === "access";
+}
+
+function getJwtExp(token: string): number {
+  const payload = extractJwtPayload(token);
+  return isFiniteNumber(payload?.exp) ? payload.exp : 0;
+}
+
+// ==================== Device Id ====================
+// 官网前端会为每个登录会话生成固定 device_id，并保证 X-Device-Id 请求头
+// 与 JWT payload 中的 device_id 一致（新防护会校验）。refreshToken 本身
+// 就是 JWT，其 payload 中携带 device_id，直接提取使用。
+
+const deviceIdCache: Record<string, string> = {};
+
+function extractDeviceIdFromToken(refreshToken: string): string | null {
+  const data = extractJwtPayload(refreshToken);
+  if (data && typeof data.device_id === "string" && /^[0-9a-f]{32}$/.test(data.device_id)) return data.device_id;
+  return null;
+}
+
+async function getDeviceId(credential: Credential): Promise<string> {
+  const key = credential.token;
+  if (deviceIdCache[key]) return deviceIdCache[key];
+  let id = extractDeviceIdFromToken(key);
+  if (!id) id = await md5(`${key}:device_id`);
+  deviceIdCache[key] = id;
+  return id;
 }
 
 // ==================== Tool Calling Helpers ====================
@@ -205,8 +260,8 @@ function getTokenCacheKey(refreshToken: string): Request {
   return new Request(`https://internal-cache/glm-token/${refreshToken}`);
 }
 
-async function getCachedAccessToken(refreshToken: string): Promise<string | null> {
-  const response = await getWorkerCache().match(getTokenCacheKey(refreshToken));
+async function getCachedAccessToken(key: string): Promise<string | null> {
+  const response = await getWorkerCache().match(getTokenCacheKey(key));
   if (!response) return null;
   try {
     const data: any = await response.json();
@@ -215,48 +270,47 @@ async function getCachedAccessToken(refreshToken: string): Promise<string | null
   return null;
 }
 
-async function setCachedAccessToken(refreshToken: string, accessToken: string, refreshTime: number) {
-  await getWorkerCache().put(getTokenCacheKey(refreshToken), new Response(JSON.stringify({ accessToken, refreshTime }), {
+async function setCachedAccessToken(key: string, accessToken: string, refreshTime: number) {
+  await getWorkerCache().put(getTokenCacheKey(key), new Response(JSON.stringify({ accessToken, refreshTime }), {
     headers: { "Content-Type": "application/json" }
   }));
 }
 
-async function deleteCachedAccessToken(refreshToken: string) {
-  await getWorkerCache().delete(getTokenCacheKey(refreshToken));
+async function deleteCachedAccessToken(key: string) {
+  await getWorkerCache().delete(getTokenCacheKey(key));
 }
 
 async function generateSign() {
-  const e = Date.now();
-  const A = e.toString();
-  const t = A.length;
-  const o = A.split("").map((c) => Number(c));
-  const i = o.reduce((sum, v) => sum + v, 0) - o[t - 2];
-  const a = i % 10;
-  const timestamp = A.substring(0, t - 2) + a + A.substring(t - 1, t);
+  // 2026-10 抓包验证：x-timestamp 直接为原始毫秒时间戳（不再做校验位替换），
+  // x-sign = md5(`${timestamp}-${nonce}-${signSecret}`)，secret 未变。
+  const ts = Date.now().toString();
   const nonce = uuid(false);
-  const sign = await md5(`${timestamp}-${nonce}-${signSecret}`);
-  return { timestamp, nonce, sign };
+  const sign = await md5(`${ts}-${nonce}-${signSecret}`);
+  return { timestamp: ts, nonce, sign };
 }
 
 const tokenRequestQueues: Record<string, Array<(result: any) => void>> = {};
 
-async function requestToken(refreshToken: string) {
-  if (tokenRequestQueues[refreshToken]) {
-    return new Promise((resolve) => tokenRequestQueues[refreshToken].push(resolve));
+async function requestToken(credential: Credential) {
+  const key = credential.token;
+  if (tokenRequestQueues[key]) {
+    return new Promise((resolve) => tokenRequestQueues[key].push(resolve));
   }
-  tokenRequestQueues[refreshToken] = [];
+  tokenRequestQueues[key] = [];
   const doRequest = async () => {
     const sign = await generateSign();
+    const deviceId = await getDeviceId(credential);
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 15000);
     try {
       const response = await fetch("https://chatglm.cn/chatglm/user-api/user/refresh", {
         method: "POST",
         headers: {
-          Authorization: `Bearer ${refreshToken}`,
+          Authorization: `Bearer ${key}`,
           "Content-Type": "application/json",
+          ...(credential.cookie ? { Cookie: credential.cookie } : {}),
           ...getHeaders(),
-          "X-Device-Id": uuid(false),
+          "X-Device-Id": deviceId,
           "X-Nonce": sign.nonce,
           "X-Request-Id": uuid(false),
           "X-Sign": sign.sign,
@@ -264,7 +318,7 @@ async function requestToken(refreshToken: string) {
         },
         signal: controller.signal,
       });
-      const data = await checkResult(response, refreshToken);
+      const data = await checkResult(response, credential);
       const { access_token, refresh_token } = data.result;
       return { accessToken: access_token, refreshToken: refresh_token, refreshTime: unixTimestamp() + ACCESS_TOKEN_EXPIRES };
     } finally {
@@ -273,27 +327,40 @@ async function requestToken(refreshToken: string) {
   };
   try {
     const result = await doRequest();
-    tokenRequestQueues[refreshToken].forEach((resolve) => resolve(result));
+    tokenRequestQueues[key].forEach((resolve) => resolve(result));
     return result;
   } catch (err) {
-    tokenRequestQueues[refreshToken].forEach((resolve) => resolve(err));
+    tokenRequestQueues[key].forEach((resolve) => resolve(err));
     throw err;
   } finally {
-    delete tokenRequestQueues[refreshToken];
+    delete tokenRequestQueues[key];
   }
 }
 
-async function acquireToken(refreshToken: string): Promise<string> {
-  const cached = await getCachedAccessToken(refreshToken);
+async function acquireToken(credential: Credential): Promise<string> {
+  const key = credential.token;
+  // 直接配置的 access token：直接使用，缓存至 JWT exp 前 2 分钟
+  if (isAccessToken(key)) {
+    const cached = await getCachedAccessToken(key);
+    if (cached) return cached;
+    const exp = getJwtExp(key);
+    if (exp - 120 > unixTimestamp()) {
+      await setCachedAccessToken(key, key, exp - 120);
+      return key;
+    }
+    throw new Error("[请求glm失败]: access_token已过期，请重新抓取或更新token");
+  }
+  const cached = await getCachedAccessToken(key);
   if (cached) return cached;
-  const tokenData: any = await requestToken(refreshToken);
-  await setCachedAccessToken(refreshToken, tokenData.accessToken, tokenData.refreshTime);
+  const tokenData: any = await requestToken(credential);
+  await setCachedAccessToken(key, tokenData.accessToken, tokenData.refreshTime);
   return tokenData.accessToken;
 }
 
-async function removeConversation(convId: string, refreshToken: string, assistantId = DEFAULT_ASSISTANT_ID) {
-  const token = await acquireToken(refreshToken);
+async function removeConversation(convId: string, credential: Credential, assistantId = DEFAULT_ASSISTANT_ID) {
+  const token = await acquireToken(credential);
   const sign = await generateSign();
+  const deviceId = await getDeviceId(credential);
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), 15000);
   try {
@@ -302,7 +369,8 @@ async function removeConversation(convId: string, refreshToken: string, assistan
       headers: {
         Authorization: `Bearer ${token}`,
         Referer: "https://chatglm.cn/main/alltoolsdetail",
-        "X-Device-Id": uuid(false),
+        ...(credential.cookie ? { Cookie: credential.cookie } : {}),
+        "X-Device-Id": deviceId,
         "X-Request-Id": uuid(false),
         "X-Sign": sign.sign,
         "X-Timestamp": sign.timestamp,
@@ -312,18 +380,18 @@ async function removeConversation(convId: string, refreshToken: string, assistan
       body: JSON.stringify({ assistant_id: assistantId, conversation_id: convId }),
       signal: controller.signal,
     });
-    await checkResult(response, refreshToken);
+    await checkResult(response, credential);
   } catch {}
   finally { clearTimeout(timeoutId); }
 }
 
-async function checkResult(response: Response, refreshToken: string): Promise<any> {
+async function checkResult(response: Response, credential: Credential): Promise<any> {
   const data: any = await response.json().catch(() => null);
   if (!data) return null;
   const { code, status, message } = data;
   if (!isFiniteNumber(code) && !isFiniteNumber(status)) return data;
   if (code === 0 || status === 0) return data;
-  if (code == 401) await deleteCachedAccessToken(refreshToken);
+  if (code == 401) await deleteCachedAccessToken(credential.token);
   if (message?.includes('40102')) {
     throw new Error(`[请求glm失败]: 您的refresh_token已过期，请重新登录获取`);
   }
@@ -345,18 +413,39 @@ async function glmPostStream(url: string, body: any, headers: Record<string, str
   }
 }
 
-export async function createCompletion(messages: any[], refreshToken: string, model = MODEL_NAME, refConvId = "", retryCount = 0, tools?: any[]): Promise<any> {
+// 2026-10 抓包对齐：meta_data 移除 if_plus_model，新增 selected_model；
+// 深度思考模式为 chat_mode=deep_thinking + reasoning_effort=max。
+function buildMetaData(model: string, assistantId: string) {
+  let chatMode: string | undefined;
+  let reasoningEffort: string | undefined;
+  if (model.includes('think') || model.includes('zero')) { chatMode = 'deep_thinking'; reasoningEffort = 'max'; }
+  if (model.includes('deepresearch')) { chatMode = 'deep_research'; }
+  return {
+    channel: "",
+    chat_mode: chatMode,
+    draft_id: "",
+    input_question_type: "xxxx",
+    is_networking: true,
+    is_test: false,
+    platform: "pc",
+    quote_log_id: "",
+    ...(assistantId == DEFAULT_ASSISTANT_ID ? { selected_model: "glm-5.3" } : {}),
+    ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
+    cogview: { rm_label_watermark: false }
+  };
+}
+
+export async function createCompletion(messages: any[], refreshToken: string | Credential, model = MODEL_NAME, refConvId = "", retryCount = 0, tools?: any[]): Promise<any> {
+  const credential = normalizeCredential(refreshToken);
   return (async () => {
     let processedMessages = convertToolMessages(messages);
     processedMessages = injectToolsPrompt(processedMessages, tools || []);
     const refFileUrls = extractRefFileUrls(processedMessages);
-    const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))) : [];
+    const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, credential))) : [];
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
     let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
-    let chatMode = '';
-    if (model.includes('think') || model.includes('zero')) { chatMode = 'zero'; }
-    if (model.includes('deepresearch')) { chatMode = 'deep_research'; }
-    const token = await acquireToken(refreshToken);
+    const deviceId = await getDeviceId(credential);
+    const token = await acquireToken(credential);
     const sign = await generateSign();
     const response = await glmPostStream(
       "https://chatglm.cn/chatglm/backend-api/assistant/stream",
@@ -366,23 +455,13 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
         project_id: "",
         chat_type: "user_chat",
         messages: messagesPrepare(processedMessages, refs, !!refConvId),
-        meta_data: {
-          channel: "",
-          chat_mode: chatMode || undefined,
-          draft_id: "",
-          if_plus_model: true,
-          input_question_type: "xxxx",
-          is_networking: true,
-          is_test: false,
-          platform: "pc",
-          quote_log_id: "",
-          cogview: { rm_label_watermark: false }
-        },
+        meta_data: buildMetaData(model, assistantId),
       },
       {
         Authorization: `Bearer ${token}`,
+        ...(credential.cookie ? { Cookie: credential.cookie } : {}),
         ...getHeaders(),
-        "X-Device-Id": uuid(false),
+        "X-Device-Id": deviceId,
         "X-Request-Id": uuid(false),
         "X-Sign": sign.sign,
         "X-Timestamp": sign.timestamp,
@@ -396,30 +475,29 @@ export async function createCompletion(messages: any[], refreshToken: string, mo
       throw new Error(`Stream response Content-Type invalid: ${contentType}`);
     }
     const answer = await receiveStream(model, response.body!, tools);
-    removeConversation(answer.id, refreshToken, assistantId).catch(() => {});
+    removeConversation(answer.id, credential, assistantId).catch(() => {});
     return answer;
   })().catch(async (err) => {
     if (retryCount < MAX_RETRY_COUNT) {
       console.error(`Stream response error: ${err.stack || err.message}`);
       await sleep(RETRY_DELAY);
-      return createCompletion(messages, refreshToken, model, refConvId, retryCount + 1, tools);
+      return createCompletion(messages, credential, model, refConvId, retryCount + 1, tools);
     }
     throw err;
   });
 }
 
-export async function createCompletionStream(messages: any[], refreshToken: string, model = MODEL_NAME, refConvId = "", retryCount = 0, tools?: any[]): Promise<ReadableStream> {
+export async function createCompletionStream(messages: any[], refreshToken: string | Credential, model = MODEL_NAME, refConvId = "", retryCount = 0, tools?: any[]): Promise<ReadableStream> {
+  const credential = normalizeCredential(refreshToken);
   return (async () => {
     let processedMessages = convertToolMessages(messages);
     processedMessages = injectToolsPrompt(processedMessages, tools || []);
     const refFileUrls = extractRefFileUrls(processedMessages);
-    const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, refreshToken))) : [];
+    const refs = refFileUrls.length ? await Promise.all(refFileUrls.map((fileUrl) => uploadFile(fileUrl, credential))) : [];
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
     let assistantId = /^[a-z0-9]{24,}$/.test(model) ? model : DEFAULT_ASSISTANT_ID;
-    let chatMode = '';
-    if (model.includes('think') || model.includes('zero')) { chatMode = 'zero'; }
-    if (model.includes('deepresearch')) { chatMode = 'deep_research'; }
-    const token = await acquireToken(refreshToken);
+    const deviceId = await getDeviceId(credential);
+    const token = await acquireToken(credential);
     const sign = await generateSign();
     const response = await glmPostStream(
       "https://chatglm.cn/chatglm/backend-api/assistant/stream",
@@ -429,23 +507,13 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
         project_id: "",
         chat_type: "user_chat",
         messages: messagesPrepare(processedMessages, refs, !!refConvId),
-        meta_data: {
-          channel: "",
-          chat_mode: chatMode || undefined,
-          draft_id: "",
-          if_plus_model: true,
-          input_question_type: "xxxx",
-          is_networking: true,
-          is_test: false,
-          platform: "pc",
-          quote_log_id: "",
-          cogview: { rm_label_watermark: false }
-        },
+        meta_data: buildMetaData(model, assistantId),
       },
       {
         Authorization: `Bearer ${token}`,
         Referer: assistantId == DEFAULT_ASSISTANT_ID ? "https://chatglm.cn/main/alltoolsdetail" : `https://chatglm.cn/main/gdetail/${assistantId}`,
-        "X-Device-Id": uuid(false),
+        ...(credential.cookie ? { Cookie: credential.cookie } : {}),
+        "X-Device-Id": deviceId,
         "X-Request-Id": uuid(false),
         "X-Sign": sign.sign,
         "X-Timestamp": sign.timestamp,
@@ -471,22 +539,24 @@ export async function createCompletionStream(messages: any[], refreshToken: stri
       });
     }
     return createTransStream(model, response.body!, (convId: string) => {
-      removeConversation(convId, refreshToken, assistantId).catch(() => {});
+      removeConversation(convId, credential, assistantId).catch(() => {});
     }, tools);
   })().catch(async (err) => {
     if (retryCount < MAX_RETRY_COUNT) {
       console.error(`Stream response error: ${err.stack || err.message}`);
       await sleep(RETRY_DELAY);
-      return createCompletionStream(messages, refreshToken, model, refConvId, retryCount + 1, tools);
+      return createCompletionStream(messages, credential, model, refConvId, retryCount + 1, tools);
     }
     throw err;
   });
 }
 
-export async function generateImages(model = "65a232c082ff90a2ad2f15e2", prompt: string, refreshToken: string, retryCount = 0): Promise<string[]> {
+export async function generateImages(model = "65a232c082ff90a2ad2f15e2", prompt: string, refreshToken: string | Credential, retryCount = 0): Promise<string[]> {
+  const credential = normalizeCredential(refreshToken);
   return (async () => {
     const messages = [{ role: "user", content: prompt.indexOf("画") == -1 ? `请画：${prompt}` : prompt }];
-    const token = await acquireToken(refreshToken);
+    const deviceId = await getDeviceId(credential);
+    const token = await acquireToken(credential);
     const sign = await generateSign();
     const response = await glmPostStream(
       "https://chatglm.cn/chatglm/backend-api/assistant/stream",
@@ -495,14 +565,15 @@ export async function generateImages(model = "65a232c082ff90a2ad2f15e2", prompt:
         conversation_id: "",
         messages: messagesPrepare(messages, []),
         meta_data: {
-          channel: "", draft_id: "", if_plus_model: true,
+          channel: "", draft_id: "",
           input_question_type: "xxxx", is_test: false, platform: "pc", quote_log_id: ""
         },
       },
       {
         Authorization: `Bearer ${token}`,
         Referer: `https://chatglm.cn/main/gdetail/${model}`,
-        "X-Device-Id": uuid(false),
+        ...(credential.cookie ? { Cookie: credential.cookie } : {}),
+        "X-Device-Id": deviceId,
         "X-Request-Id": uuid(false),
         "X-Sign": sign.sign,
         "X-Timestamp": sign.timestamp,
@@ -513,34 +584,36 @@ export async function generateImages(model = "65a232c082ff90a2ad2f15e2", prompt:
     const contentType = response.headers.get("content-type") || "";
     if (!contentType.includes("text/event-stream")) throw new Error(`Stream response Content-Type invalid: ${contentType}`);
     const { convId, imageUrls } = await receiveImages(response.body!);
-    removeConversation(convId, refreshToken, model).catch(() => {});
+    removeConversation(convId, credential, model).catch(() => {});
     if (imageUrls.length == 0) throw new Error("图像生成失败");
     return imageUrls;
   })().catch(async (err) => {
     if (retryCount < MAX_RETRY_COUNT) {
       console.error(`Image generation error: ${err.message}`);
       await sleep(RETRY_DELAY);
-      return generateImages(model, prompt, refreshToken, retryCount + 1);
+      return generateImages(model, prompt, credential, retryCount + 1);
     }
     throw err;
   });
 }
 
-export async function generateVideos(model = "cogvideox", prompt: string, refreshToken: string, options: {
+export async function generateVideos(model = "cogvideox", prompt: string, refreshToken: string | Credential, options: {
   imageUrl: string; videoStyle: string; emotionalAtmosphere: string; mirrorMode: string; audioId: string;
 }, refConvId = "", retryCount = 0): Promise<any[]> {
+  const credential = normalizeCredential(refreshToken);
   return (async () => {
     if (!/[0-9a-zA-Z]{24}/.test(refConvId)) refConvId = "";
     const sourceList: string[] = [];
     if (model == "cogvideox-pro") {
-      const imageUrls = await generateImages(undefined as any, prompt, refreshToken);
+      const imageUrls = await generateImages(undefined as any, prompt, credential);
       options.imageUrl = imageUrls[0];
     }
     if (options.imageUrl) {
-      const uploadResult = await uploadFile(options.imageUrl, refreshToken, true);
+      const uploadResult = await uploadFile(options.imageUrl, credential, true);
       sourceList.push(uploadResult.source_id);
     }
-    let token = await acquireToken(refreshToken);
+    let token = await acquireToken(credential);
+    const deviceId = await getDeviceId(credential);
     const sign = await generateSign();
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 30000);
@@ -551,7 +624,8 @@ export async function generateVideos(model = "cogvideox", prompt: string, refres
         headers: {
           Authorization: `Bearer ${token}`,
           Referer: "https://chatglm.cn/video",
-          "X-Device-Id": uuid(false),
+          ...(credential.cookie ? { Cookie: credential.cookie } : {}),
+          "X-Device-Id": deviceId,
           "X-Request-Id": uuid(false),
           "X-Sign": sign.sign,
           "X-Timestamp": sign.timestamp,
@@ -571,14 +645,14 @@ export async function generateVideos(model = "cogvideox", prompt: string, refres
         }),
         signal: controller.signal,
       });
-      result = await checkResult(resp, refreshToken);
+      result = await checkResult(resp, credential);
     } finally { clearTimeout(timeoutId); }
     const { chat_id: chatId, conversation_id: convId } = result.result;
     const startTime = unixTimestamp();
     const results: any[] = [];
     while (true) {
       if (unixTimestamp() - startTime > 600) throw new Error("视频生成失败：超时");
-      token = await acquireToken(refreshToken);
+      token = await acquireToken(credential);
       const s = await generateSign();
       const ctrl = new AbortController();
       const tid = setTimeout(() => ctrl.abort(), 30000);
@@ -588,7 +662,8 @@ export async function generateVideos(model = "cogvideox", prompt: string, refres
           headers: {
             Authorization: `Bearer ${token}`,
             Referer: "https://chatglm.cn/video",
-            "X-Device-Id": uuid(false),
+            ...(credential.cookie ? { Cookie: credential.cookie } : {}),
+            "X-Device-Id": deviceId,
             "X-Request-Id": uuid(false),
             "X-Sign": s.sign,
             "X-Timestamp": s.timestamp,
@@ -597,7 +672,7 @@ export async function generateVideos(model = "cogvideox", prompt: string, refres
           },
           signal: ctrl.signal,
         });
-        statusResult = await checkResult(resp, refreshToken);
+        statusResult = await checkResult(resp, credential);
       } finally { clearTimeout(tid); }
       const { status, video_url, cover_url, video_duration, resolution } = statusResult.result;
       if (status != "init" && status != "processing") {
@@ -605,7 +680,7 @@ export async function generateVideos(model = "cogvideox", prompt: string, refres
         let videoUrl = video_url;
         if (options.audioId) {
           const [key, id] = options.audioId.split("-");
-          token = await acquireToken(refreshToken);
+          token = await acquireToken(credential);
           const s2 = await generateSign();
           const ctrl2 = new AbortController();
           const tid2 = setTimeout(() => ctrl2.abort(), 30000);
@@ -615,7 +690,8 @@ export async function generateVideos(model = "cogvideox", prompt: string, refres
               headers: {
                 Authorization: `Bearer ${token}`,
                 Referer: "https://chatglm.cn/video",
-                "X-Device-Id": uuid(false),
+                ...(credential.cookie ? { Cookie: credential.cookie } : {}),
+                "X-Device-Id": deviceId,
                 "X-Request-Id": uuid(false),
                 "X-Sign": s2.sign,
                 "X-Timestamp": s2.timestamp,
@@ -626,7 +702,7 @@ export async function generateVideos(model = "cogvideox", prompt: string, refres
               body: JSON.stringify({ chat_id: chatId, key, audio_id: id }),
               signal: ctrl2.signal,
             });
-            const compositeResult = await checkResult(resp, refreshToken);
+            const compositeResult = await checkResult(resp, credential);
             videoUrl = compositeResult.result.url;
           } finally { clearTimeout(tid2); }
         }
@@ -637,14 +713,14 @@ export async function generateVideos(model = "cogvideox", prompt: string, refres
     }
     fetch(`https://chatglm.cn/chatglm/video-api/v1/chat/${chatId}`, {
       method: "DELETE",
-      headers: { Authorization: `Bearer ${token}`, Referer: "https://chatglm.cn/video", "X-Device-Id": uuid(false), "X-Request-Id": uuid(false), ...getHeaders() },
+      headers: { Authorization: `Bearer ${token}`, Referer: "https://chatglm.cn/video", ...(credential.cookie ? { Cookie: credential.cookie } : {}), "X-Device-Id": deviceId, "X-Request-Id": uuid(false), ...getHeaders() },
     }).catch(() => {});
     return results;
   })().catch(async (err) => {
     if (retryCount < MAX_RETRY_COUNT) {
       console.error(`Video generation error: ${err.message}`);
       await sleep(RETRY_DELAY);
-      return generateVideos(model, prompt, refreshToken, options, refConvId, retryCount + 1);
+      return generateVideos(model, prompt, credential, options, refConvId, retryCount + 1);
     }
     throw err;
   });
@@ -716,7 +792,8 @@ async function checkFileUrl(fileUrl: string) {
   }
 }
 
-async function uploadFile(fileUrl: string, refreshToken: string, isVideoImage = false) {
+async function uploadFile(fileUrl: string, refreshToken: string | Credential, isVideoImage = false) {
+  const credential = normalizeCredential(refreshToken);
   await checkFileUrl(fileUrl);
   let filename: string, fileData: ArrayBuffer, mimeType: string | null = null;
   if (isBASE64Data(fileUrl)) {
@@ -734,7 +811,8 @@ async function uploadFile(fileUrl: string, refreshToken: string, isVideoImage = 
   // 注意：CF Worker 不支持 sharp，跳过图片 resize
   const formData = new FormData();
   formData.append("file", new Blob([fileData], { type: mimeType }), filename);
-  const token = await acquireToken(refreshToken);
+  const deviceId = await getDeviceId(credential);
+  const token = await acquireToken(credential);
   const uploadUrl = isVideoImage
     ? "https://chatglm.cn/chatglm/video-api/v1/static/upload"
     : "https://chatglm.cn/chatglm/backend-api/assistant/file_upload";
@@ -743,11 +821,13 @@ async function uploadFile(fileUrl: string, refreshToken: string, isVideoImage = 
     headers: {
       Authorization: `Bearer ${token}`,
       Referer: isVideoImage ? "https://chatglm.cn/video" : "https://chatglm.cn/",
+      ...(credential.cookie ? { Cookie: credential.cookie } : {}),
+      "X-Device-Id": deviceId,
       ...getHeaders(),
     },
     body: formData,
   });
-  const uploadResult = await checkResult(response, refreshToken);
+  const uploadResult = await checkResult(response, credential);
   return uploadResult.result;
 }
 
@@ -1097,15 +1177,36 @@ export function tokenSplit(authorization: string): string[] {
   return authorization.replace("Bearer ", "").split(",");
 }
 
-export async function getTokenLiveStatus(refreshToken: string) {
-  const sign = await generateSign();
+export async function getTokenLiveStatus(refreshToken: string | Credential) {
+  const credential = normalizeCredential(refreshToken);
+  const deviceId = await getDeviceId(credential);
   try {
+    if (isAccessToken(credential.token)) {
+      // access token：用 chat_status 只读接口探活（refresh 接口不认 access token）
+      const sign = await generateSign();
+      const response = await fetch("https://chatglm.cn/chatglm/mainchat-api/guest/chat_status", {
+        headers: {
+          Authorization: `Bearer ${credential.token}`,
+          ...(credential.cookie ? { Cookie: credential.cookie } : {}),
+          "X-Device-Id": deviceId,
+          "X-Request-Id": uuid(false),
+          "X-Sign": sign.sign,
+          "X-Timestamp": sign.timestamp,
+          "X-Nonce": sign.nonce,
+          ...getHeaders(),
+        },
+      });
+      const data = await checkResult(response, credential);
+      return data.status === 0;
+    }
+    const sign = await generateSign();
     const response = await fetch("https://chatglm.cn/chatglm/user-api/user/refresh", {
       method: "POST",
       headers: {
-        Authorization: `Bearer ${refreshToken}`,
+        Authorization: `Bearer ${credential.token}`,
         Referer: "https://chatglm.cn/main/alltoolsdetail",
-        "X-Device-Id": uuid(false),
+        ...(credential.cookie ? { Cookie: credential.cookie } : {}),
+        "X-Device-Id": deviceId,
         "X-Request-Id": uuid(false),
         "X-Sign": sign.sign,
         "X-Timestamp": sign.timestamp,
@@ -1114,7 +1215,7 @@ export async function getTokenLiveStatus(refreshToken: string) {
         "Content-Type": "application/json",
       },
     });
-    const data = await checkResult(response, refreshToken);
+    const data = await checkResult(response, credential);
     return !!data.result?.access_token;
   } catch {
     return false;

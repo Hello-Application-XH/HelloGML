@@ -135,9 +135,61 @@ npx wrangler deploy
 
 部署成功后，终端会输出 Worker 的访问地址。由于 `.workers.dev` 域名在中国大陆可能被拦截，建议绑定自定义域名以获得最佳访问体验。
 
+### Linux / 本地 Node 直跑（无需 Cloudflare）
+
+项目提供独立入口 [`server.ts`](server.ts)，在任意 Linux 服务器（或本机）用 Node 22.6+ 直接运行，**无需 wrangler 和 Cloudflare 账号**：
+
+```bash
+# 需要 Node.js 22.6+（内置 TS type-stripping，无需编译）
+PORT=8000 ADMIN_KEY=your-key node --experimental-strip-types server.ts
+```
+
+- Token 池持久化在 `./data/glm-tokens.json`（`GLM_KV_FILE` 可改路径），重启不丢
+- `SIGN_SECRET` / `ADMIN_KEY` / `PORT` 均通过环境变量配置
+- 全部业务逻辑（路由、签名、token 轮询、cookie 推送）与 CF Worker 版完全一致
+
+生产环境建议用 pm2 或 systemd 守护：
+
+```bash
+pm2 start "node --experimental-strip-types server.ts" --name glm2api
+```
+
+> `server.ts` 内置了两个 CF 专属 API 的兼容层：`crypto.subtle.digest("MD5")`（转接 node:crypto）与 `caches.default` / `KVNamespace`（内存实现 + 文件持久化），因此 Worker 代码零改动即可运行。
+
 ---
 
 ## Token 管理
+
+### 2026-10 接口与防护变更适配（重要）
+
+chatglm.cn 于 2026-10 更新了接口与防护，本项目已同步适配：
+
+1. **签名算法未变**（已用真实抓包验证）：`x-sign = md5(timestamp-nonce-secret)`，但 `x-timestamp` 不再做校验位替换。
+2. **请求头对齐官网**：`X-App-Fr` 改为 `default`（原 `browser_extension` 已被防护识别拦截），新增 `X-App-Platform`，UA/sec-ch-ua 升级到 Chrome 154。
+3. **`X-Device-Id` 必须与 token 内的 device_id 一致**：自动从 JWT payload 提取，不再每次随机。
+4. **请求体 `meta_data` 更新**：移除 `if_plus_model`，新增 `selected_model`；深度思考模式为 `chat_mode=deep_thinking` + `reasoning_effort=max`。
+5. **（关键）核心接口要求浏览器风控 cookie**：`backend-api/assistant/stream` 等接口必须携带 `ssxmod_itna` / `ssxmod_itna2` cookie，缺失时返回 `bad request(40012)`。该 cookie 由浏览器端 JS 基于环境指纹与行为动态生成（时窗约 10-15 分钟），**服务端无法自行生成**，需外部推送保鲜。
+
+**Token 池条目支持三种配置方式**（通过 `/admin/token`）：
+
+| 方式 | 请求体 | 说明 |
+| --- | --- | --- |
+| refresh_token + cookie | `{ "refresh_token": "eyJ...", "cookie": "ssxmod_itna=...; ssxmod_itna2=..." }` | 标准方式；cookie 缺失或过期时对话接口会 40012 |
+| 纯 access_token | `{ "access_token": "eyJ..." }` | 直接使用浏览器 `chatglm_token`（24h 有效），无需 refresh |
+| 纯 refresh_token | `{ "refresh_token": "eyJ..." }` | 兼容旧格式；当前 refresh 接口已变更（40012），暂不可用 |
+
+**cookie 保鲜（必需）**：安装项目根目录的 `chatglm-cookie-keeper.user.js` 油猴脚本，在 chatglm.cn 页面后台每 8 分钟自动把最新 ssxmod cookie 推送到 Worker（需配置脚本里的 `WORKER_URL` 与 `ADMIN_KEY`）。也可手动推送：
+
+```bash
+curl -X POST https://<your-worker-domain>/admin/cookie \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: <your-admin-key>" \
+  -d '{ "cookie": "ssxmod_itna=...; ssxmod_itna2=..." }'
+```
+
+> 未指定 `id` 时推送给池内全部 token 条目；指定 `{ "id": "tk_xxx" }` 时只更新该条目。
+
+---
 
 本项目采用**认证与资源分离**的架构：
 

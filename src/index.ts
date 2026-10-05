@@ -1,4 +1,5 @@
 import { setSignSecret } from "./chat.ts";
+import type { Credential } from "./chat.ts";
 import {
   createCompletion,
   createCompletionStream,
@@ -55,26 +56,40 @@ async function verifyAPIKey(kv: KVNamespace, apiKey: string): Promise<boolean> {
   return val !== null;
 }
 
-async function getTokenPool(kv: KVNamespace): Promise<{ id: string; token: string }[]> {
+// 池条目解析：兼容纯 token 字符串与 JSON {"token":"...","cookie":"..."}
+function parsePoolEntry(raw: string): { token: string; cookie?: string } | null {
+  if (!raw) return null;
+  try {
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj.token === "string" && obj.token) {
+      return { token: obj.token, cookie: typeof obj.cookie === "string" && obj.cookie ? obj.cookie : undefined };
+    }
+  } catch {}
+  return { token: raw };
+}
+
+async function getTokenPool(kv: KVNamespace): Promise<{ id: string; token: string; cookie?: string }[]> {
   const list = await kv.list({ prefix: "rt:" });
-  const tokens: { id: string; token: string }[] = [];
+  const tokens: { id: string; token: string; cookie?: string }[] = [];
   for (const key of list.keys) {
-    const token = await kv.get(key.name);
-    if (token) tokens.push({ id: key.name.replace("rt:", ""), token });
+    const raw = await kv.get(key.name);
+    const entry = raw ? parsePoolEntry(raw) : null;
+    if (entry) tokens.push({ id: key.name.replace("rt:", ""), token: entry.token, cookie: entry.cookie });
   }
   return tokens;
 }
 
 let tokenRoundRobinIndex = 0;
 
-function selectTokenFromPool(tokens: { id: string; token: string }[]): string | null {
+function selectTokenFromPool(tokens: { id: string; token: string; cookie?: string }[]): Credential | null {
   if (tokens.length === 0) return null;
   const idx = tokenRoundRobinIndex % tokens.length;
   tokenRoundRobinIndex++;
-  return tokens[idx].token;
+  const picked = tokens[idx];
+  return { token: picked.token, cookie: picked.cookie };
 }
 
-async function authenticate(request: Request, env: Env): Promise<string> {
+async function authenticate(request: Request, env: Env): Promise<Credential> {
   const apiKeys = extractAPIKeys(request);
   if (apiKeys.length === 0) throw new Error("Missing Authorization header");
 
@@ -90,9 +105,9 @@ async function authenticate(request: Request, env: Env): Promise<string> {
   const pool = await getTokenPool(env.GLM_TOKENS);
   if (pool.length === 0) throw new Error("No refresh tokens available in pool");
 
-  const token = selectTokenFromPool(pool);
-  if (!token) throw new Error("Failed to select token from pool");
-  return token;
+  const credential = selectTokenFromPool(pool);
+  if (!credential) throw new Error("Failed to select token from pool");
+  return credential;
 }
 
 function jsonResponse(data: any, status = 200): Response {
@@ -294,16 +309,27 @@ async function handleAdminToken(request: Request, env: Env): Promise<Response> {
 
   if (request.method === "POST") {
     const body = (await request.json()) as any;
-    const refreshToken = body.refresh_token;
-    if (!refreshToken) return errorResponse("Missing refresh_token", 400);
+    // 支持三种写法：{refresh_token, cookie?} / {access_token, cookie?} / {token, cookie?}
+    // cookie 为可选的浏览器 cookie 串（至少包含 ssxmod_itna 与 ssxmod_itna2），
+    // 2026-10 新防护下核心对话接口必须携带，缺失会返回 bad request(40012)。
+    const token = body.refresh_token || body.access_token || body.token;
+    if (!token) return errorResponse("Missing refresh_token or access_token", 400);
+    const cookie = typeof body.cookie === "string" && body.cookie.trim() ? body.cookie.trim() : undefined;
     const id = body.id || `tk_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    await env.GLM_TOKENS.put(`rt:${id}`, refreshToken);
-    return jsonResponse({ success: true, message: "Token added to pool", id });
+    await env.GLM_TOKENS.put(`rt:${id}`, JSON.stringify({ token, ...(cookie ? { cookie } : {}) }));
+    return jsonResponse({ success: true, message: "Token added to pool", id, with_cookie: !!cookie });
   }
 
   if (request.method === "GET") {
     const pool = await getTokenPool(env.GLM_TOKENS);
-    return jsonResponse({ tokens: pool.map((t) => ({ id: t.id, token_preview: t.token.slice(0, 8) + "****" + t.token.slice(-4) })) });
+    return jsonResponse({
+      tokens: pool.map((t) => ({
+        id: t.id,
+        token_preview: t.token.slice(0, 8) + "****" + t.token.slice(-4),
+        token_type: t.token.split(".").length === 3 ? (() => { try { const p = JSON.parse(atob(t.token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))); return p.type || "unknown"; } catch { return "unknown"; } })() : "unknown",
+        with_cookie: !!t.cookie,
+      })),
+    });
   }
 
   if (request.method === "DELETE") {
@@ -327,11 +353,44 @@ async function handleAdminTokenCheck(request: Request, env: Env): Promise<Respon
   const id = body.id;
   if (!id) return errorResponse("Missing id", 400);
 
-  const refreshToken = await env.GLM_TOKENS.get(`rt:${id}`);
-  if (!refreshToken) return errorResponse("Token not found", 404);
+  const raw = await env.GLM_TOKENS.get(`rt:${id}`);
+  if (!raw) return errorResponse("Token not found", 404);
+  const entry = parsePoolEntry(raw);
+  if (!entry) return errorResponse("Token entry invalid", 400);
 
-  const live = await getTokenLiveStatus(refreshToken);
+  const live = await getTokenLiveStatus({ token: entry.token, cookie: entry.cookie });
   return jsonResponse({ id, live });
+}
+
+// 2026-10 新防护：stream 等核心接口要求携带浏览器端 JS 动态生成的
+// ssxmod_itna / ssxmod_itna2 风控 cookie（时窗约 10-15 分钟，服务端无法自行生成）。
+// 通过本端点由外部（如油猴脚本）定期推送新鲜 cookie 保活。
+async function handleAdminCookie(request: Request, env: Env): Promise<Response> {
+  const adminKey = request.headers.get("X-Admin-Key") || "";
+  if (env.ADMIN_KEY && adminKey !== env.ADMIN_KEY) {
+    return errorResponse("Unauthorized: invalid admin key", 401);
+  }
+
+  if (request.method !== "POST") return errorResponse("Method not allowed, use POST", 405);
+
+  const body = (await request.json()) as any;
+  const cookie = typeof body.cookie === "string" ? body.cookie.trim() : "";
+  if (!cookie) return errorResponse("Missing cookie", 400);
+
+  const list = await env.GLM_TOKENS.list({ prefix: "rt:" });
+  if (list.keys.length === 0) return errorResponse("Token pool is empty", 404);
+
+  let updated = 0;
+  for (const key of list.keys) {
+    const raw = await env.GLM_TOKENS.get(key.name);
+    const entry = raw ? parsePoolEntry(raw) : null;
+    if (!entry) continue;
+    // 未指定 id 时更新全部条目（多 token 通常共用同一浏览器风控环境）
+    if (body.id && key.name !== `rt:${body.id}`) continue;
+    await env.GLM_TOKENS.put(key.name, JSON.stringify({ token: entry.token, cookie }));
+    updated++;
+  }
+  return jsonResponse({ success: true, updated, message: "Cookie pushed to token pool" });
 }
 
 // ==================== Main Export ====================
@@ -384,6 +443,8 @@ export default {
         response = await handleAdminToken(request, env);
       } else if (path === "/admin/token/check" && request.method === "POST") {
         response = await handleAdminTokenCheck(request, env);
+      } else if (path === "/admin/cookie" && request.method === "POST") {
+        response = await handleAdminCookie(request, env);
       } else {
         const message = `[请求有误]: 正确请求为 POST -> /v1/chat/completions，当前请求为 ${request.method} -> ${path} 请纠正`;
         response = errorResponse(message, 404);
